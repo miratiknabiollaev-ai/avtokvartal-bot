@@ -27,7 +27,6 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GROUP_ID = int(os.environ.get("GROUP_ID", "-1003729022693"))
 MY_ID = int(os.environ.get("MY_ID", "642291500"))
 AD_ACCOUNT = os.environ.get("AD_ACCOUNT", "act_1322638451268170")
-USD_KZT_RATE = float(os.environ.get("USD_KZT_RATE", "450"))
 META_ACCESS_TOKEN = os.environ["META_ACCESS_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
@@ -153,14 +152,14 @@ async def build_daily_report() -> str:
         with_leads = [a for a in ads if a["leads"] > 0]
         if with_leads:
             best = min(with_leads, key=lambda a: a["cost_per_lead"])
-            best_line = f"{best['name']} — {best['cost_per_lead']:.0f} тг/заявка"
+            best_line = f"{best['name']} — ${best['cost_per_lead']:.2f}/заявка"
         else:
             best_line = "пока нет данных"
 
         spenders = [a for a in ads if a["spend"] > 0]
         if spenders:
             worst = max(spenders, key=lambda a: (a["cost_per_lead"] or float("inf")))
-            worst_value = f"{worst['cost_per_lead']:.0f} тг/заявка" if worst["cost_per_lead"] else "потратило, но без заявок"
+            worst_value = f"${worst['cost_per_lead']:.2f}/заявка" if worst["cost_per_lead"] else "потратило, но без заявок"
             worst_line = f"{worst['name']} — {worst_value} (рекомендую отключить)"
         else:
             worst_line = "пока нет данных"
@@ -175,13 +174,13 @@ async def build_daily_report() -> str:
         conversion = (targets / leads * 100) if leads else 0.0
         cost_per_target = (spend / targets) if targets else 0.0
         target_line = f"{targets} (конверсия: {conversion:.0f}%)"
-        price_line = f"{cost_per_target:.0f} тг (цель снизить)"
+        price_line = f"${cost_per_target:.2f} (цель снизить)"
 
     report = (
         "📊 ЕЖЕДНЕВНЫЙ ОТЧЁТ — Автоквартал\n"
         f"📅 Дата: {d}\n"
-        f"💰 Потрачено сегодня: {spend:.0f} тг\n"
-        f"📩 Заявок из рекламы: {leads} (цена: {cost_per_lead:.0f} тг)\n"
+        f"💰 Потрачено сегодня: ${spend:.2f}\n"
+        f"📩 Заявок из рекламы: {leads} (цена: ${cost_per_lead:.2f})\n"
         f"🎯 Целевых (из CRM): {target_line}\n"
         f"💵 Цена целевой заявки: {price_line}\n"
         f"🏆 Лучшее объявление: {best_line}\n"
@@ -201,11 +200,11 @@ async def check_alerts(app: Application):
         alerts = []
 
         if insights["leads"] and insights["cost_per_lead"] > 800:
-            alerts.append(f"⚠️ Цена заявки выросла: {insights['cost_per_lead']:.0f} тг (выше 800 тг)")
+            alerts.append(f"⚠️ Цена заявки выросла: ${insights['cost_per_lead']:.2f} (выше $800)")
 
         for ad in ads:
             if ad["leads"] == 0 and ad["spend"] > 2000:
-                alerts.append(f"⚠️ Объявление «{ad['name']}» потратило {ad['spend']:.0f} тг без единой заявки — рекомендую отключить")
+                alerts.append(f"⚠️ Объявление «{ad['name']}» потратило ${ad['spend']:.2f} без единой заявки — рекомендую отключить")
 
         targets = targets_by_date.get(d)
         if targets is not None and insights["leads"]:
@@ -267,7 +266,7 @@ async def cmd_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"Записал: {n} целевых заявок за {d}.\n"
             f"Конверсия: {conversion:.0f}% ({n} из {leads})\n"
-            f"Цена целевой заявки: {cost_per_target:.0f} тг"
+            f"Цена целевой заявки: ${cost_per_target:.2f}"
         )
     except Exception:
         logger.exception("Ошибка при расчёте конверсии")
@@ -282,7 +281,7 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         lines = ["🏆 Топ-3 лучших объявления:"]
         for i, ad in enumerate(best, 1):
-            lines.append(f"{i}. {ad['name']} — {ad['cost_per_lead']:.0f} тг/заявка ({ad['leads']} заявок)")
+            lines.append(f"{i}. {ad['name']} — ${ad['cost_per_lead']:.2f}/заявка ({ad['leads']} заявок)")
         await update.message.reply_text("\n".join(lines))
     except Exception:
         logger.exception("Ошибка /топ")
@@ -298,9 +297,9 @@ async def cmd_flop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = ["📉 Топ-3 худших объявления:"]
         for i, ad in enumerate(worst, 1):
             if ad["cost_per_lead"]:
-                lines.append(f"{i}. {ad['name']} — {ad['cost_per_lead']:.0f} тг/заявка, потрачено {ad['spend']:.0f} тг")
+                lines.append(f"{i}. {ad['name']} — ${ad['cost_per_lead']:.2f}/заявка, потрачено ${ad['spend']:.2f}")
             else:
-                lines.append(f"{i}. {ad['name']} — потрачено {ad['spend']:.0f} тг без заявок")
+                lines.append(f"{i}. {ad['name']} — потрачено ${ad['spend']:.2f} без заявок")
         await update.message.reply_text("\n".join(lines))
     except Exception:
         logger.exception("Ошибка /флоп")
@@ -310,7 +309,7 @@ async def cmd_flop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         spend = fetch_month_spend()
-        await update.message.reply_text(f"💰 Потрачено за месяц: {spend:.0f} тг (~{spend / USD_KZT_RATE:.2f} $)")
+        await update.message.reply_text(f"💰 Потрачено за месяц: ${spend:.2f}")
     except Exception:
         logger.exception("Ошибка /бюджет")
         await update.message.reply_text("Не удалось получить данные из Meta API.")
@@ -349,12 +348,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         insights = fetch_insights(date_preset="today")
         targets = targets_by_date.get(d)
         context_summary = (
-            f"Сегодня ({d}) потрачено {insights['spend']:.0f} тг, "
+            f"Сегодня ({d}) потрачено ${insights['spend']:.2f}, "
             f"получено {insights['leads']} заявок из рекламы (WhatsApp), "
-            f"цена заявки {insights['cost_per_lead']:.0f} тг. "
+            f"цена заявки ${insights['cost_per_lead']:.2f}. "
             f"Целевых заявок (реальных покупателей по данным CRM): "
-            f"{targets if targets is not None else 'пока не указано клиентом'}. "
-            f"Курс: 1 USD = {USD_KZT_RATE} тг."
+            f"{targets if targets is not None else 'пока не указано клиентом'}."
         )
     except Exception:
         logger.exception("Не удалось получить данные Meta API для контекста Claude")
