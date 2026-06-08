@@ -46,6 +46,18 @@ def today_str() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d")
 
 
+def detect_period(text: str) -> tuple[str, str]:
+    """Определяет период по тексту сообщения: (date_preset для Meta API, человекочитаемая подпись)."""
+    t = (text or "").lower()
+    if "вчера" in t or "yesterday" in t:
+        return "yesterday", "вчера"
+    if "недел" in t or "week" in t:
+        return "last_7d", "последние 7 дней"
+    if "месяц" in t or "month" in t:
+        return "last_30d", "последние 30 дней"
+    return "today", "сегодня"
+
+
 def fetch_insights(date_preset: str = "today") -> dict:
     """Берёт суммарные данные по аккаунту: затраты, лиды (сообщения WhatsApp), цена за лид."""
     params = {
@@ -123,8 +135,8 @@ def get_conversion_stats(d: str | None = None):
     }
 
 
-def best_and_worst_ads(n: int = 3):
-    ads = fetch_ads_breakdown()
+def best_and_worst_ads(n: int = 3, date_preset: str = "today"):
+    ads = fetch_ads_breakdown(date_preset)
     ranked = [a for a in ads if a["leads"] > 0]
     ranked.sort(key=lambda a: a["cost_per_lead"])
     best = ranked[:n]
@@ -138,9 +150,11 @@ def best_and_worst_ads(n: int = 3):
 # --- Формирование отчёта ---
 
 async def build_daily_report() -> str:
+    """Отчёт по умолчанию для /отчёт: сегодня + вчера для сравнения."""
     d = today_str()
     insights = fetch_insights(date_preset="today")
-    ads = fetch_ads_breakdown()
+    yesterday = fetch_insights(date_preset="yesterday")
+    ads = fetch_ads_breakdown(date_preset="today")
 
     spend = insights["spend"]
     leads = insights["leads"]
@@ -154,7 +168,7 @@ async def build_daily_report() -> str:
             best = min(with_leads, key=lambda a: a["cost_per_lead"])
             best_line = f"{best['name']} — ${best['cost_per_lead']:.2f}/заявка"
         else:
-            best_line = "пока нет данных"
+            best_line = "сегодня пока нет объявлений с заявками"
 
         spenders = [a for a in ads if a["spend"] > 0]
         if spenders:
@@ -162,10 +176,10 @@ async def build_daily_report() -> str:
             worst_value = f"${worst['cost_per_lead']:.2f}/заявка" if worst["cost_per_lead"] else "потратило, но без заявок"
             worst_line = f"{worst['name']} — {worst_value} (рекомендую отключить)"
         else:
-            worst_line = "пока нет данных"
+            worst_line = "сегодня пока нет расходов по объявлениям"
     else:
-        best_line = "пока нет данных"
-        worst_line = "пока нет данных"
+        best_line = "сегодня пока нет объявлений с заявками"
+        worst_line = "сегодня пока нет расходов по объявлениям"
 
     if targets is None:
         target_line = "ожидаю от клиента — напишите /целевые N"
@@ -179,14 +193,86 @@ async def build_daily_report() -> str:
     report = (
         "📊 ЕЖЕДНЕВНЫЙ ОТЧЁТ — Автоквартал\n"
         f"📅 Дата: {d}\n"
-        f"💰 Потрачено сегодня: ${spend:.2f}\n"
-        f"📩 Заявок из рекламы: {leads} (цена: ${cost_per_lead:.2f})\n"
+        f"💰 Потрачено сегодня: ${spend:.2f} (вчера: ${yesterday['spend']:.2f})\n"
+        f"📩 Заявок из рекламы: {leads} (цена: ${cost_per_lead:.2f}) "
+        f"— вчера: {yesterday['leads']} (цена: ${yesterday['cost_per_lead']:.2f})\n"
         f"🎯 Целевых (из CRM): {target_line}\n"
         f"💵 Цена целевой заявки: {price_line}\n"
         f"🏆 Лучшее объявление: {best_line}\n"
         f"⚠️ Внимание: {worst_line}"
     )
     return report
+
+
+async def build_period_report(date_preset: str, label: str) -> str:
+    """Отчёт за произвольный период (вчера/неделя/месяц), который запрашивает Meta API напрямую."""
+    insights = fetch_insights(date_preset=date_preset)
+    ads = fetch_ads_breakdown(date_preset=date_preset)
+
+    spend = insights["spend"]
+    leads = insights["leads"]
+    cost_per_lead = insights["cost_per_lead"]
+
+    if ads:
+        with_leads = [a for a in ads if a["leads"] > 0]
+        if with_leads:
+            best = min(with_leads, key=lambda a: a["cost_per_lead"])
+            best_line = f"{best['name']} — ${best['cost_per_lead']:.2f}/заявка ({best['leads']} заявок)"
+        else:
+            best_line = "нет объявлений с заявками за этот период"
+
+        spenders = [a for a in ads if a["spend"] > 0]
+        if spenders:
+            worst = max(spenders, key=lambda a: (a["cost_per_lead"] or float("inf")))
+            worst_value = f"${worst['cost_per_lead']:.2f}/заявка" if worst["cost_per_lead"] else "потратило, но без заявок"
+            worst_line = f"{worst['name']} — {worst_value}"
+        else:
+            worst_line = "нет расходов по объявлениям за этот период"
+    else:
+        best_line = "нет объявлений с заявками за этот период"
+        worst_line = "нет расходов по объявлениям за этот период"
+
+    report = (
+        f"📊 ОТЧЁТ — Автоквартал ({label})\n"
+        f"💰 Потрачено: ${spend:.2f}\n"
+        f"📩 Заявок из рекламы: {leads} (цена: ${cost_per_lead:.2f})\n"
+        f"🏆 Лучшее объявление: {best_line}\n"
+        f"⚠️ Худшее объявление: {worst_line}"
+    )
+    return report
+
+
+def build_meta_context(date_preset: str, label: str) -> str:
+    """Собирает свежую сводку из Meta API за нужный период для передачи в Claude."""
+    insights = fetch_insights(date_preset=date_preset)
+    ads = fetch_ads_breakdown(date_preset=date_preset)
+    d = today_str()
+    targets = targets_by_date.get(d)
+
+    lines = [
+        f"Период: {label}.",
+        f"Потрачено: ${insights['spend']:.2f}.",
+        f"Заявок из рекламы (WhatsApp): {insights['leads']} (цена за заявку: ${insights['cost_per_lead']:.2f}).",
+    ]
+
+    with_leads = [a for a in ads if a["leads"] > 0]
+    if with_leads:
+        best = min(with_leads, key=lambda a: a["cost_per_lead"])
+        lines.append(
+            f"Лучшее объявление: «{best['name']}» — ${best['cost_per_lead']:.2f}/заявка, {best['leads']} заявок."
+        )
+    spenders = [a for a in ads if a["spend"] > 0]
+    if spenders:
+        worst = max(spenders, key=lambda a: (a["cost_per_lead"] or float("inf")))
+        worst_val = f"${worst['cost_per_lead']:.2f}/заявка" if worst["cost_per_lead"] else "потратило без единой заявки"
+        lines.append(f"Худшее объявление: «{worst['name']}» — {worst_val}, потрачено ${worst['spend']:.2f}.")
+
+    lines.append(
+        "Целевых заявок за сегодня по CRM: "
+        + (str(targets) if targets is not None else "клиент ещё не передал — можно попросить через /целевые N")
+        + "."
+    )
+    return "\n".join(lines)
 
 
 # --- Алерты ---
@@ -224,7 +310,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я бот аналитики Meta Ads для Автоквартал.\n\n"
         "Команды:\n"
-        "/отчёт — отчёт прямо сейчас\n"
+        "/отчёт — отчёт за сегодня (со сравнением с вчера)\n"
+        "/отчёт за вчера / за неделю / за месяц — отчёт за нужный период\n"
         "/целевые N — указать сколько целевых заявок было сегодня\n"
         "/топ — топ-3 лучших объявления\n"
         "/флоп — топ-3 худших объявления\n"
@@ -235,8 +322,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    date_preset, label = detect_period(update.message.text)
     try:
-        report = await build_daily_report()
+        if date_preset == "today":
+            report = await build_daily_report()
+        else:
+            report = await build_period_report(date_preset, label)
         await update.message.reply_text(report)
     except Exception:
         logger.exception("Ошибка при формировании отчёта")
@@ -342,28 +433,22 @@ async def cmd_conversion(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     logger.info("Текст не распознан как команда, ухожу к Claude: %r", user_text)
-    d = today_str()
 
+    date_preset, label = detect_period(user_text)
     try:
-        insights = fetch_insights(date_preset="today")
-        targets = targets_by_date.get(d)
-        context_summary = (
-            f"Сегодня ({d}) потрачено ${insights['spend']:.2f}, "
-            f"получено {insights['leads']} заявок из рекламы (WhatsApp), "
-            f"цена заявки ${insights['cost_per_lead']:.2f}. "
-            f"Целевых заявок (реальных покупателей по данным CRM): "
-            f"{targets if targets is not None else 'пока не указано клиентом'}."
-        )
+        meta_context = build_meta_context(date_preset, label)
     except Exception:
         logger.exception("Не удалось получить данные Meta API для контекста Claude")
-        context_summary = "Данные из Meta API сейчас недоступны."
+        meta_context = (
+            f"Период: {label}. Не получилось обратиться к Meta API прямо сейчас "
+            "(возможно, временная сетевая ошибка) — предупреди об этом и предложи повторить запрос через минуту."
+        )
 
     system_prompt = (
-        "Ты — аналитик по рекламе в Meta (Facebook/Instagram) для жилого комплекса «Автоквартал». "
-        "Реклама ведёт на WhatsApp. Целевая заявка — это человек, который реально купил "
-        "(определяется клиентом вручную из CRM). Текущая конверсия из заявки в целевую — около 20% "
-        "(1 из 5). Твоя задача — помогать поднимать конверсию и снижать цену целевой заявки. "
-        "Отвечай кратко, по делу, на русском языке, давай конкретные практические советы."
+        "Ты опытный таргетолог, который ведёт рекламу в Meta (Facebook/Instagram) для жилого комплекса "
+        "«Автоквартал» (реклама ведёт на WhatsApp, целевая заявка — реальный покупатель по данным CRM клиента). "
+        "Анализируй данные из Meta Ads и давай конкретные советы. "
+        "Отвечай на русском, коротко и по делу. Не говори что данных нет — иди и получи их сам."
     )
 
     try:
@@ -374,7 +459,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages=[
                 {
                     "role": "user",
-                    "content": f"Контекст по рекламе на сегодня: {context_summary}\n\nВопрос пользователя: {user_text}",
+                    "content": f"Свежие данные из Meta Ads:\n{meta_context}\n\nВопрос пользователя: {user_text}",
                 }
             ],
         )
