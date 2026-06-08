@@ -342,6 +342,7 @@ async def cmd_conversion(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
+    logger.info("Текст не распознан как команда, ухожу к Claude: %r", user_text)
     d = today_str()
 
     try:
@@ -415,7 +416,7 @@ def main():
     def cyrillic_command(word: str) -> filters.Regex:
         return filters.Regex(re.compile(rf"^/?{word}(@\w+)?\b", re.IGNORECASE | re.UNICODE))
 
-    app.add_handler(MessageHandler(cyrillic_command("отчёт"), cmd_report))
+    app.add_handler(MessageHandler(cyrillic_command("отч[её]т"), cmd_report))
     app.add_handler(MessageHandler(cyrillic_command("целевые"), cmd_targets))
     app.add_handler(MessageHandler(cyrillic_command("топ"), cmd_top))
     app.add_handler(MessageHandler(cyrillic_command("флоп"), cmd_flop))
