@@ -39,6 +39,12 @@ claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 # Целевые заявки храним в памяти: {"YYYY-MM-DD": int}
 targets_by_date: dict[str, int] = {}
 
+# Объявление, ожидающее подтверждения отключения от MY_ID: {"ad_id", "ad_name", "spend"} | None
+pending_action: dict | None = None
+
+# Объявления, по которым владелец сказал "нет" — не спрашивать повторно 24 часа: {ad_id: datetime_until}
+snoozed_until: dict[str, datetime] = {}
+
 
 # --- Работа с Meta Marketing API ---
 
@@ -86,7 +92,7 @@ def fetch_ads_breakdown(date_preset: str = "today") -> list[dict]:
     """Возвращает список объявлений с затратами, лидами и ценой за лид."""
     params = {
         "access_token": META_ACCESS_TOKEN,
-        "fields": "ad_name,spend,actions",
+        "fields": "ad_id,ad_name,spend,actions",
         "date_preset": date_preset,
         "level": "ad",
         "limit": 100,
@@ -104,12 +110,23 @@ def fetch_ads_breakdown(date_preset: str = "today") -> list[dict]:
                 leads += int(float(action.get("value", 0)))
         cost_per_lead = (spend / leads) if leads else None
         ads.append({
+            "id": row.get("ad_id"),
             "name": row.get("ad_name", "Без названия"),
             "spend": spend,
             "leads": leads,
             "cost_per_lead": cost_per_lead,
         })
     return ads
+
+
+def set_ad_status(ad_id: str, status: str) -> None:
+    """Меняет статус объявления в Meta Ads (например, ставит на паузу)."""
+    resp = requests.post(
+        f"{GRAPH_API_URL}/{ad_id}",
+        params={"access_token": META_ACCESS_TOKEN, "status": status},
+        timeout=30,
+    )
+    resp.raise_for_status()
 
 
 def fetch_month_spend() -> float:
@@ -174,7 +191,7 @@ async def build_daily_report() -> str:
         if spenders:
             worst = max(spenders, key=lambda a: (a["cost_per_lead"] or float("inf")))
             worst_value = f"${worst['cost_per_lead']:.2f}/заявка" if worst["cost_per_lead"] else "потратило, но без заявок"
-            worst_line = f"{worst['name']} — {worst_value} (рекомендую отключить)"
+            worst_line = f"{worst['name']} — {worst_value}"
         else:
             worst_line = "сегодня пока нет расходов по объявлениям"
     else:
@@ -278,30 +295,97 @@ def build_meta_context(date_preset: str, label: str) -> str:
 # --- Алерты ---
 
 async def check_alerts(app: Application):
+    global pending_action
     try:
         insights = fetch_insights(date_preset="today")
-        ads = fetch_ads_breakdown()
+        ads = fetch_ads_breakdown(date_preset="today")
         d = today_str()
+        now = datetime.now(TZ)
 
-        alerts = []
+        # Объявление тратит бюджет без единой заявки за 24 часа — спрашиваем разрешение отключить.
+        if pending_action is None:
+            for ad in ads:
+                if ad["leads"] == 0 and ad["spend"] > 2000 and ad["id"]:
+                    until = snoozed_until.get(ad["id"])
+                    if until and now < until:
+                        continue
+                    pending_action = {"ad_id": ad["id"], "ad_name": ad["name"], "spend": ad["spend"]}
+                    await app.bot.send_message(
+                        chat_id=MY_ID,
+                        text=f"Объявление {ad['name']}: потрачено ${ad['spend']:.2f}, заявок 0 за 24 часа. Отключить?",
+                    )
+                    break
 
+        # Остальное — короткие факты в личку, без советов.
         if insights["leads"] and insights["cost_per_lead"] > 800:
-            alerts.append(f"⚠️ Цена заявки выросла: ${insights['cost_per_lead']:.2f} (выше $800)")
-
-        for ad in ads:
-            if ad["leads"] == 0 and ad["spend"] > 2000:
-                alerts.append(f"⚠️ Объявление «{ad['name']}» потратило ${ad['spend']:.2f} без единой заявки — рекомендую отключить")
+            await app.bot.send_message(
+                chat_id=MY_ID,
+                text=f"Цена заявки: ${insights['cost_per_lead']:.2f} (порог $800).",
+            )
 
         targets = targets_by_date.get(d)
         if targets is not None and insights["leads"]:
             conversion = targets / insights["leads"] * 100
             if conversion < 15:
-                alerts.append(f"⚠️ Конверсия упала до {conversion:.0f}% (ниже 15%)")
-
-        for alert in alerts:
-            await app.bot.send_message(chat_id=MY_ID, text=alert)
+                await app.bot.send_message(
+                    chat_id=MY_ID,
+                    text=f"Конверсия: {conversion:.0f}% ({targets} целевых из {insights['leads']} заявок, порог 15%).",
+                )
     except Exception:
         logger.exception("Ошибка при проверке алертов")
+
+
+# --- Подтверждение действий владельцем (MY_ID, личка) ---
+
+class OwnerConfirmationFilter(filters.MessageFilter):
+    """Срабатывает только если есть открытый запрос на действие и пришёл ответ да/нет от владельца."""
+
+    YES = ("да", "yes", "ага", "угу", "+")
+    NO = ("нет", "no", "не", "-")
+
+    def filter(self, message) -> bool:
+        if pending_action is None:
+            return False
+        if message.chat.type != "private" or not message.from_user or message.from_user.id != MY_ID:
+            return False
+        text = (message.text or "").strip().lower()
+        return text in self.YES or text in self.NO
+
+
+owner_confirmation_filter = OwnerConfirmationFilter()
+
+
+async def handle_owner_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global pending_action
+    action = pending_action
+    if action is None:
+        return
+
+    text = (update.message.text or "").strip().lower()
+    ad_id = action["ad_id"]
+    ad_name = action["ad_name"]
+    spend = action["spend"]
+
+    if text in OwnerConfirmationFilter.YES:
+        try:
+            set_ad_status(ad_id, "PAUSED")
+            pending_action = None
+            await update.message.reply_text(
+                f"Готово. Отключил {ad_name}. Бюджет ${spend:.2f}/день освобождён."
+            )
+            await context.bot.send_message(
+                chat_id=GROUP_ID,
+                text=f"Оптимизация: отключено объявление {ad_name}. Экономия ${spend:.2f}/день.",
+            )
+        except Exception:
+            logger.exception("Не удалось отключить объявление через Meta API")
+            await update.message.reply_text(
+                f"Не получилось отключить {ad_name} через Meta API. Попробую ещё раз позже."
+            )
+    else:
+        snoozed_until[ad_id] = datetime.now(TZ) + timedelta(hours=24)
+        pending_action = None
+        await update.message.reply_text("Понял")
 
 
 # --- Команды ---
@@ -445,10 +529,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     system_prompt = (
-        "Ты опытный таргетолог, который ведёт рекламу в Meta (Facebook/Instagram) для жилого комплекса "
-        "«Автоквартал» (реклама ведёт на WhatsApp, целевая заявка — реальный покупатель по данным CRM клиента). "
-        "Анализируй данные из Meta Ads и давай конкретные советы. "
-        "Отвечай на русском, коротко и по делу. Не говори что данных нет — иди и получи их сам."
+        "Ты ассистент таргетолога который уже всё сделал. Говори фактами — что сделано, какие цифры "
+        "до и после. Никаких советов и рекомендаций. Только действия и результаты. "
+        "Пиши чисто, без markdown, без таблиц, короткими абзацами."
     )
 
     try:
@@ -505,6 +588,7 @@ def main():
     app.add_handler(MessageHandler(cyrillic_command("флоп"), cmd_flop))
     app.add_handler(MessageHandler(cyrillic_command("бюджет"), cmd_budget))
     app.add_handler(MessageHandler(cyrillic_command("конверсия"), cmd_conversion))
+    app.add_handler(MessageHandler(owner_confirmation_filter, handle_owner_confirmation))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Бот запускается...")
