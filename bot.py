@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 from datetime import datetime, date, timezone, timedelta
 
@@ -411,12 +412,15 @@ def main():
     # Telegram распознаёт как команды только латиницу (/[a-zA-Z0-9_]+),
     # поэтому кириллические "команды" обрабатываем как обычный текст по regex.
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(MessageHandler(filters.Regex(r"^/?отчёт\b"), cmd_report))
-    app.add_handler(MessageHandler(filters.Regex(r"^/?целевые\b"), cmd_targets))
-    app.add_handler(MessageHandler(filters.Regex(r"^/?топ\b"), cmd_top))
-    app.add_handler(MessageHandler(filters.Regex(r"^/?флоп\b"), cmd_flop))
-    app.add_handler(MessageHandler(filters.Regex(r"^/?бюджет\b"), cmd_budget))
-    app.add_handler(MessageHandler(filters.Regex(r"^/?конверсия\b"), cmd_conversion))
+    def cyrillic_command(word: str) -> filters.Regex:
+        return filters.Regex(re.compile(rf"^/?{word}(@\w+)?\b", re.IGNORECASE | re.UNICODE))
+
+    app.add_handler(MessageHandler(cyrillic_command("отчёт"), cmd_report))
+    app.add_handler(MessageHandler(cyrillic_command("целевые"), cmd_targets))
+    app.add_handler(MessageHandler(cyrillic_command("топ"), cmd_top))
+    app.add_handler(MessageHandler(cyrillic_command("флоп"), cmd_flop))
+    app.add_handler(MessageHandler(cyrillic_command("бюджет"), cmd_budget))
+    app.add_handler(MessageHandler(cyrillic_command("конверсия"), cmd_conversion))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Бот запускается...")
