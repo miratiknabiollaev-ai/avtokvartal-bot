@@ -621,21 +621,98 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Планировщик ---
 
-async def scheduled_daily_report(app: Application):
+async def claude_scheduled_message(prompt: str) -> str:
+    """Запрашивает Meta API через Claude и возвращает готовый текст для группы."""
+    system_prompt = (
+        f"Ты таргетолог рекламного кабинета Meta Ads {AD_ACCOUNT}.\n"
+        f"Токен для Meta API: {META_ACCESS_TOKEN}\n"
+        "Запроси актуальные данные через инструменты, затем дай краткую сводку и 1-2 конкретных "
+        "рекомендации что сделать прямо сейчас. Пиши без markdown, без таблиц, короткими абзацами."
+    )
+    messages = [{"role": "user", "content": prompt}]
+
+    for _ in range(10):
+        response = claude_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            system=system_prompt,
+            tools=META_TOOLS,
+            messages=messages,
+        )
+        if response.stop_reason == "end_turn":
+            text_parts = [b.text for b in response.content if hasattr(b, "text")]
+            return "\n".join(text_parts).strip()
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                result_json = execute_meta_tool(block.name, block.input)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result_json,
+                })
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+        else:
+            break
+
+    return ""
+
+
+async def scheduled_morning_report(app: Application):
+    """9:00 — утренняя сводка: итоги вчера + план на сегодня."""
     try:
-        report = await build_daily_report()
-        await app.bot.send_message(chat_id=GROUP_ID, text=report)
+        text = await claude_scheduled_message(
+            "Утренняя сводка. Запроси данные за вчера (yesterday). "
+            "Напиши итог вчерашнего дня — потрачено, заявок, цена заявки, лучшее и худшее объявление. "
+            "Затем дай 1-2 рекомендации что скорректировать в кампаниях сегодня."
+        )
+        if text:
+            await app.bot.send_message(chat_id=GROUP_ID, text=f"Доброе утро. Итоги вчера:\n\n{text}")
     except Exception:
-        logger.exception("Ошибка отправки ежедневного отчёта")
+        logger.exception("Ошибка утреннего отчёта")
+
+
+async def scheduled_midday_report(app: Application):
+    """14:00 — дневной чекап: как идёт день прямо сейчас."""
+    try:
+        text = await claude_scheduled_message(
+            "Дневной чекап. Запроси данные за сегодня (today). "
+            "Напиши как идёт день — потрачено, заявок, цена заявки. "
+            "Если есть объявления без заявок при значительном бюджете — укажи их. "
+            "Дай 1-2 конкретных рекомендации что изменить прямо сейчас."
+        )
+        if text:
+            await app.bot.send_message(chat_id=GROUP_ID, text=f"Дневной чекап:\n\n{text}")
+    except Exception:
+        logger.exception("Ошибка дневного чекапа")
+
+
+async def scheduled_evening_report(app: Application):
+    """20:00 — вечерний итог дня + рекомендации на завтра."""
+    try:
+        text = await claude_scheduled_message(
+            "Вечерний итог дня. Запроси данные за сегодня (today). "
+            "Напиши полный итог: потрачено, заявок, цена заявки, лучшее и худшее объявление. "
+            "Дай 2-3 рекомендации что запустить или отключить завтра."
+        )
+        if text:
+            await app.bot.send_message(chat_id=GROUP_ID, text=f"Итог дня:\n\n{text}")
+    except Exception:
+        logger.exception("Ошибка вечернего отчёта")
 
 
 async def post_init(app: Application):
     scheduler = AsyncIOScheduler(timezone=TZ)
-    scheduler.add_job(scheduled_daily_report, CronTrigger(hour=20, minute=0), args=[app])
+    scheduler.add_job(scheduled_morning_report, CronTrigger(hour=9, minute=0), args=[app])
+    scheduler.add_job(scheduled_midday_report, CronTrigger(hour=14, minute=0), args=[app])
+    scheduler.add_job(scheduled_evening_report, CronTrigger(hour=20, minute=0), args=[app])
     scheduler.add_job(check_alerts, CronTrigger(minute="*/30"), args=[app])
     scheduler.start()
     app.bot_data["scheduler"] = scheduler
-    logger.info("Планировщик запущен: ежедневный отчёт в 20:00 (UTC+5), проверка алертов каждые 30 минут")
+    logger.info("Планировщик: утро 9:00, день 14:00, вечер 20:00 (UTC+5), алерты каждые 30 мин")
 
 
 def main():
