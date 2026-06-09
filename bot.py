@@ -1,5 +1,7 @@
 import os
 import re
+import json
+import asyncio
 import logging
 from datetime import datetime, date, timezone, timedelta
 
@@ -35,6 +37,59 @@ TZ = timezone(timedelta(hours=5))  # UTC+5 (Алматы/Астана)
 GRAPH_API_URL = "https://graph.facebook.com/v19.0"
 
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# --- Инструменты Meta API для Claude (tool_use) ---
+
+META_TOOLS = [
+    {
+        "name": "get_account_insights",
+        "description": (
+            "Получить суммарную статистику рекламного кабинета Meta Ads: "
+            "общие затраты, количество лидов (заявки через WhatsApp), цена за лид."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_preset": {
+                    "type": "string",
+                    "description": "Период выборки. Допустимые значения: today, yesterday, last_7d, last_30d, this_month.",
+                    "enum": ["today", "yesterday", "last_7d", "last_30d", "this_month"],
+                }
+            },
+            "required": ["date_preset"],
+        },
+    },
+    {
+        "name": "get_ads_breakdown",
+        "description": (
+            "Получить разбивку по отдельным объявлениям: название, потрачено, количество лидов, цена за лид."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_preset": {
+                    "type": "string",
+                    "description": "Период выборки. Допустимые значения: today, yesterday, last_7d, last_30d, this_month.",
+                    "enum": ["today", "yesterday", "last_7d", "last_30d", "this_month"],
+                }
+            },
+            "required": ["date_preset"],
+        },
+    },
+]
+
+
+def execute_meta_tool(tool_name: str, tool_input: dict) -> str:
+    """Выполняет инструмент Meta API, возвращает результат в виде JSON-строки."""
+    preset = tool_input.get("date_preset", "today")
+    if tool_name == "get_account_insights":
+        data = fetch_insights(date_preset=preset)
+        return json.dumps(data, ensure_ascii=False)
+    if tool_name == "get_ads_breakdown":
+        data = fetch_ads_breakdown(date_preset=preset)
+        return json.dumps(data, ensure_ascii=False)
+    return json.dumps({"error": f"Неизвестный инструмент: {tool_name}"})
+
 
 # Целевые заявки храним в памяти: {"YYYY-MM-DD": int}
 targets_by_date: dict[str, int] = {}
@@ -259,37 +314,6 @@ async def build_period_report(date_preset: str, label: str) -> str:
     return report
 
 
-def build_meta_context(date_preset: str, label: str) -> str:
-    """Собирает свежую сводку из Meta API за нужный период для передачи в Claude."""
-    insights = fetch_insights(date_preset=date_preset)
-    ads = fetch_ads_breakdown(date_preset=date_preset)
-    d = today_str()
-    targets = targets_by_date.get(d)
-
-    lines = [
-        f"Период: {label}.",
-        f"Потрачено: ${insights['spend']:.2f}.",
-        f"Заявок из рекламы (WhatsApp): {insights['leads']} (цена за заявку: ${insights['cost_per_lead']:.2f}).",
-    ]
-
-    with_leads = [a for a in ads if a["leads"] > 0]
-    if with_leads:
-        best = min(with_leads, key=lambda a: a["cost_per_lead"])
-        lines.append(
-            f"Лучшее объявление: «{best['name']}» — ${best['cost_per_lead']:.2f}/заявка, {best['leads']} заявок."
-        )
-    spenders = [a for a in ads if a["spend"] > 0]
-    if spenders:
-        worst = max(spenders, key=lambda a: (a["cost_per_lead"] or float("inf")))
-        worst_val = f"${worst['cost_per_lead']:.2f}/заявка" if worst["cost_per_lead"] else "потратило без единой заявки"
-        lines.append(f"Худшее объявление: «{worst['name']}» — {worst_val}, потрачено ${worst['spend']:.2f}.")
-
-    lines.append(
-        "Целевых заявок за сегодня по CRM: "
-        + (str(targets) if targets is not None else "клиент ещё не передал — можно попросить через /целевые N")
-        + "."
-    )
-    return "\n".join(lines)
 
 
 # --- Алерты ---
@@ -512,46 +536,87 @@ async def cmd_conversion(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не удалось получить данные из Meta API.")
 
 
-# --- Умные ответы через Claude ---
+# --- Умные ответы через Claude (agentic loop с tool_use) ---
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     logger.info("Текст не распознан как команда, ухожу к Claude: %r", user_text)
 
-    date_preset, label = detect_period(user_text)
-    try:
-        meta_context = build_meta_context(date_preset, label)
-    except Exception:
-        logger.exception("Не удалось получить данные Meta API для контекста Claude")
-        meta_context = (
-            f"Период: {label}. Не получилось обратиться к Meta API прямо сейчас "
-            "(возможно, временная сетевая ошибка) — предупреди об этом и предложи повторить запрос через минуту."
-        )
-
     system_prompt = (
-        "Ты ассистент таргетолога который уже всё сделал. Говори фактами — что сделано, какие цифры "
-        "до и после. Никаких советов и рекомендаций. Только действия и результаты. "
-        "Пиши чисто, без markdown, без таблиц, короткими абзацами."
+        f"Ты аналитик рекламного кабинета Meta Ads {AD_ACCOUNT}.\n"
+        f"У тебя есть прямой доступ к Meta Graph API через токен: {META_ACCESS_TOKEN}\n"
+        "Когда тебя просят анализ — сам запроси данные через доступные инструменты.\n"
+        "Отвечай фактами и цифрами. Без markdown. Без советов — только факты."
     )
 
-    try:
-        message = claude_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1024,
-            system=system_prompt,
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"Свежие данные из Meta Ads:\n{meta_context}\n\nВопрос пользователя: {user_text}",
-                }
-            ],
-        )
-        reply = message.content[0].text
-    except Exception:
-        logger.exception("Ошибка обращения к Claude API")
-        reply = "Не получилось обратиться к Claude API. Попробуйте чуть позже."
+    messages = [{"role": "user", "content": user_text}]
+    notified_wait = False  # отправили ли уже "подожди 10 секунд"
 
-    await update.message.reply_text(reply)
+    for _ in range(10):  # не более 10 итераций агентного цикла
+        try:
+            response = claude_client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=1024,
+                system=system_prompt,
+                tools=META_TOOLS,
+                messages=messages,
+            )
+        except Exception:
+            logger.exception("Ошибка Claude API")
+            await update.message.reply_text("Не получилось обратиться к Claude API. Попробуйте чуть позже.")
+            return
+
+        # Claude закончил — отдаём текст пользователю
+        if response.stop_reason == "end_turn":
+            text_parts = [b.text for b in response.content if hasattr(b, "text")]
+            reply = "\n".join(text_parts).strip() or "Нет ответа."
+            await update.message.reply_text(reply)
+            return
+
+        # Claude хочет вызвать инструмент
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+
+                tool_name = block.name
+                tool_input = block.input
+                tool_id = block.id
+                result_json = None
+
+                for attempt in range(3):
+                    try:
+                        result_json = execute_meta_tool(tool_name, tool_input)
+                        break
+                    except Exception as exc:
+                        logger.warning("Meta API ошибка (попытка %d/3): %s", attempt + 1, exc)
+                        if not notified_wait:
+                            await update.message.reply_text("Запрашиваю данные, подожди 10 секунд...")
+                            notified_wait = True
+                        if attempt < 2:
+                            await asyncio.sleep(10)
+
+                if result_json is None:
+                    await update.message.reply_text("Проверь токен Meta в настройках.")
+                    return
+
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": result_json,
+                })
+
+            # Добавляем ответ ассистента и результаты инструментов в историю
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+            continue
+
+        # Неожиданный stop_reason
+        logger.warning("Неожиданный stop_reason от Claude: %s", response.stop_reason)
+        break
+
+    await update.message.reply_text("Не удалось получить ответ. Попробуйте ещё раз.")
 
 
 # --- Планировщик ---
