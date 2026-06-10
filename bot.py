@@ -212,13 +212,22 @@ INSTAGRAM_WHATSAPP_SOURCES = {
 def _bitrix_date_range(date_preset: str) -> tuple[str, str]:
     """Возвращает (date_from, date_to) для фильтрации в Bitrix24."""
     now = datetime.now(TZ)
-    if date_preset == "yesterday":
-        d = now - timedelta(days=1)
-    else:
-        d = now
-    start = d.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = d.replace(hour=23, minute=59, second=59, microsecond=0)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     fmt = "%Y-%m-%dT%H:%M:%S"
+
+    if date_preset == "yesterday":
+        start = today_start - timedelta(days=1)
+        end = today_start - timedelta(seconds=1)
+    elif date_preset == "last_7d":
+        start = today_start - timedelta(days=7)
+        end = now
+    elif date_preset == "last_30d":
+        start = today_start - timedelta(days=30)
+        end = now
+    else:  # today
+        start = today_start
+        end = now
+
     return start.strftime(fmt), end.strftime(fmt)
 
 
@@ -252,46 +261,53 @@ def fetch_bitrix_leads(date_preset: str = "today") -> dict:
     }
 
 
-def fetch_bitrix_deals(date_preset: str = "today") -> dict:
-    """Возвращает сделки из Instagram/WhatsApp из Bitrix24 за нужный период."""
-    date_from, date_to = _bitrix_date_range(date_preset)
-    all_deals = []
+def _fetch_all_deals(extra_filter: dict) -> list[dict]:
+    """Выгружает все страницы сделок с заданным фильтром."""
+    result = []
     start = 0
     while True:
         params = {
-            "filter[>=DATE_CREATE]": date_from,
-            "filter[<=DATE_CREATE]": date_to,
-            "select[]": ["ID", "DATE_CREATE", "STAGE_ID", "OPPORTUNITY", "SOURCE_ID"],
+            "select[]": ["ID", "DATE_CREATE", "CLOSEDATE", "STAGE_ID", "OPPORTUNITY", "SOURCE_ID"],
             "start": start,
+            **extra_filter,
         }
         resp = requests.get(f"{BITRIX_WEBHOOK}/crm.deal.list", params=params, timeout=30)
         resp.raise_for_status()
-        data = resp.json()
-        batch = data.get("result", [])
-        all_deals.extend(batch)
-        # Если вернулось меньше 50 — страниц больше нет
+        batch = resp.json().get("result", [])
+        result.extend(batch)
         if len(batch) < 50:
             break
         start += 50
+    return result
 
-    # Фильтруем только Instagram/WhatsApp источники
-    target_deals = [d for d in all_deals if d.get("SOURCE_ID") in INSTAGRAM_WHATSAPP_SOURCES]
 
-    closed = 0
-    closed_amount = 0.0
-    stage_counts: dict[str, int] = {}
-    for deal in target_deals:
-        st = deal.get("STAGE_ID", "UNKNOWN")
-        stage_counts[st] = stage_counts.get(st, 0) + 1
-        if "WON" in st:
-            closed += 1
-            closed_amount += float(deal.get("OPPORTUNITY") or 0)
+def fetch_bitrix_deals(date_preset: str = "today") -> dict:
+    """Сделки Instagram/WhatsApp за период: созданные + закрытые (по CLOSEDATE)."""
+    date_from, date_to = _bitrix_date_range(date_preset)
+
+    # Сделки, созданные в периоде (из нужных источников — фильтруем на клиенте)
+    created = _fetch_all_deals({
+        "filter[>=DATE_CREATE]": date_from,
+        "filter[<=DATE_CREATE]": date_to,
+    })
+    target_created = [d for d in created if d.get("SOURCE_ID") in INSTAGRAM_WHATSAPP_SOURCES]
+
+    # Сделки, закрытые (WON) в периоде — по CLOSEDATE, тоже только нужные источники
+    closed_deals = _fetch_all_deals({
+        "filter[>=CLOSEDATE]": date_from,
+        "filter[<=CLOSEDATE]": date_to,
+    })
+    target_closed = [
+        d for d in closed_deals
+        if d.get("SOURCE_ID") in INSTAGRAM_WHATSAPP_SOURCES and "WON" in (d.get("STAGE_ID") or "")
+    ]
+
+    closed_amount = sum(float(d.get("OPPORTUNITY") or 0) for d in target_closed)
 
     return {
-        "total": len(target_deals),
-        "closed": closed,
+        "total": len(target_created),
+        "closed": len(target_closed),
         "closed_amount": closed_amount,
-        "by_stage": stage_counts,
     }
 
 
@@ -802,10 +818,10 @@ async def cmd_crm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Конверсия по этапам воронки за сегодня (Instagram + WhatsApp)."""
+    """Конверсия по этапам воронки за последние 7 дней (Instagram + WhatsApp)."""
     try:
-        meta = fetch_insights(date_preset="today")
-        deals = fetch_bitrix_deals(date_preset="today")
+        meta = fetch_insights(date_preset="last_7d")
+        deals = fetch_bitrix_deals(date_preset="last_7d")
 
         meta_leads = meta["leads"]
         spend = meta["spend"]
@@ -819,8 +835,8 @@ async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cost_per_client = round(spend / crm_closed, 2) if crm_closed else 0
 
         lines = [
-            f"Воронка Автоквартал — {today_str()}",
-            f"(только Instagram + WhatsApp из CRM)",
+            f"Воронка Автоквартал — последние 7 дней",
+            f"(Instagram + WhatsApp из CRM)",
             "",
             f"Реклама → {meta_leads} заявок (${cost_per_lead} каждая)",
             f"Заявка → сделка: {pct(crm_deals, meta_leads)} ({crm_deals} из {meta_leads})",
