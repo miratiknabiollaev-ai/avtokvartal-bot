@@ -193,6 +193,22 @@ def fetch_month_spend() -> float:
 
 # --- Bitrix24 CRM ---
 
+# SOURCE_ID сделок из Instagram и WhatsApp (выявлены анализом базы)
+INSTAGRAM_WHATSAPP_SOURCES = {
+    "1|FBINSTAGRAMDIRECT",
+    "1|WZ_INSTAGRAM_AEB15A4F4755E07FF47B57CF8189EC10",
+    "1|UMNICO_WHATSAPP-81824",
+    "WZda34e12c-90ad-400d-aaa7-e020f7d65558",
+    "UC_JI402S",
+    "UC_KT0AKH",
+    "UC_QZCZNF",
+    "UC_GMDJR5",
+    "UC_DMZQU9",
+    "UC_A8932L",
+    "UC_OSEFPC",
+}
+
+
 def _bitrix_date_range(date_preset: str) -> tuple[str, str]:
     """Возвращает (date_from, date_to) для фильтрации в Bitrix24."""
     now = datetime.now(TZ)
@@ -237,32 +253,44 @@ def fetch_bitrix_leads(date_preset: str = "today") -> dict:
 
 
 def fetch_bitrix_deals(date_preset: str = "today") -> dict:
-    """Возвращает сделки из Bitrix24 за нужный период."""
+    """Возвращает сделки из Instagram/WhatsApp из Bitrix24 за нужный период."""
     date_from, date_to = _bitrix_date_range(date_preset)
-    params = {
-        "filter[>=DATE_CREATE]": date_from,
-        "filter[<=DATE_CREATE]": date_to,
-        "select[]": ["ID", "DATE_CREATE", "STAGE_ID", "OPPORTUNITY", "CURRENCY_ID", "TITLE"],
-        "start": 0,
-    }
-    resp = requests.get(f"{BITRIX_WEBHOOK}/crm.deal.list", params=params, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    deals = data.get("result", [])
+    all_deals = []
+    start = 0
+    while True:
+        params = {
+            "filter[>=DATE_CREATE]": date_from,
+            "filter[<=DATE_CREATE]": date_to,
+            "select[]": ["ID", "DATE_CREATE", "STAGE_ID", "OPPORTUNITY", "SOURCE_ID"],
+            "start": start,
+        }
+        resp = requests.get(f"{BITRIX_WEBHOOK}/crm.deal.list", params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        batch = data.get("result", [])
+        all_deals.extend(batch)
+        # Если вернулось меньше 50 — страниц больше нет
+        if len(batch) < 50:
+            break
+        start += 50
 
-    total_amount = sum(float(d.get("OPPORTUNITY") or 0) for d in deals)
-    stage_counts: dict[str, int] = {}
+    # Фильтруем только Instagram/WhatsApp источники
+    target_deals = [d for d in all_deals if d.get("SOURCE_ID") in INSTAGRAM_WHATSAPP_SOURCES]
+
     closed = 0
-    for deal in deals:
+    closed_amount = 0.0
+    stage_counts: dict[str, int] = {}
+    for deal in target_deals:
         st = deal.get("STAGE_ID", "UNKNOWN")
         stage_counts[st] = stage_counts.get(st, 0) + 1
-        if st in ("WON", "C1:WON"):  # Bitrix стадия «Успешно»
+        if "WON" in st:
             closed += 1
+            closed_amount += float(deal.get("OPPORTUNITY") or 0)
 
     return {
-        "total": len(deals),
+        "total": len(target_deals),
         "closed": closed,
-        "total_amount": total_amount,
+        "closed_amount": closed_amount,
         "by_stage": stage_counts,
     }
 
@@ -720,22 +748,23 @@ def build_morning_report() -> str:
 
     # Bitrix данные
     try:
-        crm_leads = fetch_bitrix_leads(date_preset="yesterday")
         crm_deals = fetch_bitrix_deals(date_preset="yesterday")
-        bitrix_total = crm_leads["total"]
-        bitrix_closed = crm_deals["closed"]
-        conversion = round(bitrix_total / meta_leads * 100) if meta_leads else 0
-        cost_per_crm_lead = round(spend / bitrix_total, 2) if bitrix_total else 0
+        deals_total = crm_deals["total"]
+        deals_closed = crm_deals["closed"]
+        closed_amount = crm_deals["closed_amount"]
+        conv_to_deal = round(deals_total / meta_leads * 100) if meta_leads else 0
+        cost_per_client = round(spend / deals_closed, 2) if deals_closed else 0
         crm_block = (
-            "--- CRM Bitrix ---\n"
-            f"Новых лидов: {bitrix_total}\n"
-            f"Сделок закрыто: {bitrix_closed}\n"
-            f"Конверсия реклама → лид: {conversion}%\n"
-            f"Цена целевого лида: ${cost_per_crm_lead}"
+            "--- CRM Bitrix (Instagram + WhatsApp) ---\n"
+            f"Новых сделок: {deals_total}\n"
+            f"Закрытых сделок: {deals_closed}\n"
+            f"Сумма закрытых: {closed_amount:,.0f} тг\n"
+            f"Конверсия заявка → сделка: {conv_to_deal}%\n"
+            f"Цена реального покупателя: ${cost_per_client}"
         )
     except Exception:
         logger.exception("Bitrix недоступен при формировании отчёта")
-        crm_block = "--- CRM Bitrix ---\nДанные недоступны"
+        crm_block = "--- CRM Bitrix (Instagram + WhatsApp) ---\nДанные недоступны"
 
     return (
         f"Отчёт Автоквартал — {yesterday_date}\n"
@@ -773,29 +802,31 @@ async def cmd_crm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Конверсия по этапам воронки за сегодня."""
+    """Конверсия по этапам воронки за сегодня (Instagram + WhatsApp)."""
     try:
         meta = fetch_insights(date_preset="today")
-        leads = fetch_bitrix_leads(date_preset="today")
         deals = fetch_bitrix_deals(date_preset="today")
 
         meta_leads = meta["leads"]
-        crm_leads = leads["total"]
+        spend = meta["spend"]
         crm_deals = deals["total"]
         crm_closed = deals["closed"]
 
         def pct(a, b):
             return f"{round(a / b * 100)}%" if b else "н/д"
 
+        cost_per_lead = round(spend / meta_leads, 2) if meta_leads else 0
+        cost_per_client = round(spend / crm_closed, 2) if crm_closed else 0
+
         lines = [
             f"Воронка Автоквартал — {today_str()}",
+            f"(только Instagram + WhatsApp из CRM)",
             "",
-            f"Клики в рекламе → Заявки Meta:  {pct(meta_leads, meta_leads)} ({meta_leads} шт.)",
-            f"Заявки Meta → Лиды в CRM:       {pct(crm_leads, meta_leads)} ({crm_leads} из {meta_leads})",
-            f"Лиды → Сделки:                  {pct(crm_deals, crm_leads)} ({crm_deals} из {crm_leads})",
-            f"Сделки → Закрыто (WON):         {pct(crm_closed, crm_deals)} ({crm_closed} из {crm_deals})",
+            f"Реклама → {meta_leads} заявок (${cost_per_lead} каждая)",
+            f"Заявка → сделка: {pct(crm_deals, meta_leads)} ({crm_deals} из {meta_leads})",
+            f"Сделка → закрыта: {pct(crm_closed, crm_deals)} ({crm_closed} из {crm_deals})",
             "",
-            f"Итог: реклама → продажа         {pct(crm_closed, meta_leads)}",
+            f"Цена реального покупателя: ${cost_per_client}",
         ]
         await update.message.reply_text("\n".join(lines))
     except Exception:
