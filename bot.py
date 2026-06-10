@@ -32,7 +32,8 @@ AD_ACCOUNT = os.environ.get("AD_ACCOUNT", "act_1322638451268170")
 META_ACCESS_TOKEN = os.environ["META_ACCESS_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
-TZ = timezone(timedelta(hours=5))  # UTC+5 (Алматы/Астана)
+TZ = timezone(timedelta(hours=5))       # UTC+5 для datetime-вычислений
+TZ_NAME = "Asia/Almaty"                 # для APScheduler
 
 GRAPH_API_URL = "https://graph.facebook.com/v19.0"
 
@@ -621,98 +622,69 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Планировщик ---
 
-async def claude_scheduled_message(prompt: str) -> str:
-    """Запрашивает Meta API через Claude и возвращает готовый текст для группы."""
-    system_prompt = (
-        f"Ты таргетолог рекламного кабинета Meta Ads {AD_ACCOUNT}.\n"
-        f"Токен для Meta API: {META_ACCESS_TOKEN}\n"
-        "Запроси актуальные данные через инструменты, затем дай краткую сводку и 1-2 конкретных "
-        "рекомендации что сделать прямо сейчас. Пиши без markdown, без таблиц, короткими абзацами."
+def build_morning_report() -> str:
+    """Формирует отчёт за вчерашний день в фиксированном текстовом формате."""
+    yesterday_date = (datetime.now(TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
+    insights = fetch_insights(date_preset="yesterday")
+    ads = fetch_ads_breakdown(date_preset="yesterday")
+
+    spend = insights["spend"]
+    leads = insights["leads"]
+    cost_per_lead = insights["cost_per_lead"]
+
+    with_leads = [a for a in ads if a["leads"] > 0]
+    spenders = [a for a in ads if a["spend"] > 0]
+
+    if with_leads:
+        best = min(with_leads, key=lambda a: a["cost_per_lead"])
+        best_line = f"{best['name']} — ${best['cost_per_lead']:.2f} за заявку"
+    else:
+        best_line = "нет объявлений с заявками"
+
+    if spenders:
+        worst = max(spenders, key=lambda a: (a["cost_per_lead"] or float("inf")))
+        worst_val = f"${worst['cost_per_lead']:.2f} за заявку" if worst["cost_per_lead"] else "потратило без заявок"
+        worst_line = f"{worst['name']} — {worst_val}"
+    else:
+        worst_line = "нет расходов"
+
+    return (
+        f"Отчёт Автоквартал — {yesterday_date}\n"
+        f"Потрачено: ${spend:.2f}\n"
+        f"Заявок: {leads}\n"
+        f"Цена заявки: ${cost_per_lead:.2f}\n"
+        f"Лучшее объявление: {best_line}\n"
+        f"Слабое объявление: {worst_line}"
     )
-    messages = [{"role": "user", "content": prompt}]
-
-    for _ in range(10):
-        response = claude_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1024,
-            system=system_prompt,
-            tools=META_TOOLS,
-            messages=messages,
-        )
-        if response.stop_reason == "end_turn":
-            text_parts = [b.text for b in response.content if hasattr(b, "text")]
-            return "\n".join(text_parts).strip()
-        if response.stop_reason == "tool_use":
-            tool_results = []
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
-                result_json = execute_meta_tool(block.name, block.input)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result_json,
-                })
-            messages.append({"role": "assistant", "content": response.content})
-            messages.append({"role": "user", "content": tool_results})
-        else:
-            break
-
-    return ""
 
 
-async def scheduled_morning_report(app: Application):
-    """9:00 — утренняя сводка: итоги вчера + план на сегодня."""
+async def send_morning_report(app: Application):
     try:
-        text = await claude_scheduled_message(
-            "Утренняя сводка. Запроси данные за вчера (yesterday). "
-            "Напиши итог вчерашнего дня — потрачено, заявок, цена заявки, лучшее и худшее объявление. "
-            "Затем дай 1-2 рекомендации что скорректировать в кампаниях сегодня."
-        )
-        if text:
-            await app.bot.send_message(chat_id=GROUP_ID, text=f"Доброе утро. Итоги вчера:\n\n{text}")
+        text = build_morning_report()
+        await app.bot.send_message(chat_id=GROUP_ID, text=text)
+        logger.info("Утренний отчёт отправлен")
     except Exception:
-        logger.exception("Ошибка утреннего отчёта")
+        logger.exception("Ошибка отправки утреннего отчёта")
 
 
-async def scheduled_midday_report(app: Application):
-    """14:00 — дневной чекап: как идёт день прямо сейчас."""
+async def cmd_test_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        text = await claude_scheduled_message(
-            "Дневной чекап. Запроси данные за сегодня (today). "
-            "Напиши как идёт день — потрачено, заявок, цена заявки. "
-            "Если есть объявления без заявок при значительном бюджете — укажи их. "
-            "Дай 1-2 конкретных рекомендации что изменить прямо сейчас."
-        )
-        if text:
-            await app.bot.send_message(chat_id=GROUP_ID, text=f"Дневной чекап:\n\n{text}")
+        text = build_morning_report()
+        await context.bot.send_message(chat_id=GROUP_ID, text=text)
+        if update.effective_chat.id != GROUP_ID:
+            await update.message.reply_text("Отчёт отправлен в группу.")
     except Exception:
-        logger.exception("Ошибка дневного чекапа")
-
-
-async def scheduled_evening_report(app: Application):
-    """20:00 — вечерний итог дня + рекомендации на завтра."""
-    try:
-        text = await claude_scheduled_message(
-            "Вечерний итог дня. Запроси данные за сегодня (today). "
-            "Напиши полный итог: потрачено, заявок, цена заявки, лучшее и худшее объявление. "
-            "Дай 2-3 рекомендации что запустить или отключить завтра."
-        )
-        if text:
-            await app.bot.send_message(chat_id=GROUP_ID, text=f"Итог дня:\n\n{text}")
-    except Exception:
-        logger.exception("Ошибка вечернего отчёта")
+        logger.exception("Ошибка /тест_отчёт")
+        await update.message.reply_text("Не удалось получить данные из Meta API.")
 
 
 async def post_init(app: Application):
-    scheduler = AsyncIOScheduler(timezone=TZ)
-    scheduler.add_job(scheduled_morning_report, CronTrigger(hour=9, minute=0), args=[app])
-    scheduler.add_job(scheduled_midday_report, CronTrigger(hour=14, minute=0), args=[app])
-    scheduler.add_job(scheduled_evening_report, CronTrigger(hour=20, minute=0), args=[app])
+    scheduler = AsyncIOScheduler(timezone=TZ_NAME)
+    scheduler.add_job(send_morning_report, CronTrigger(hour=9, minute=0, timezone=TZ_NAME), args=[app])
     scheduler.add_job(check_alerts, CronTrigger(minute="*/30"), args=[app])
     scheduler.start()
     app.bot_data["scheduler"] = scheduler
-    logger.info("Планировщик: утро 9:00, день 14:00, вечер 20:00 (UTC+5), алерты каждые 30 мин")
+    logger.info("Планировщик: ежедневный отчёт в 09:00 Asia/Almaty, алерты каждые 30 мин")
 
 
 def main():
@@ -725,6 +697,7 @@ def main():
         return filters.Regex(re.compile(rf"^/?{word}(@\w+)?\b", re.IGNORECASE | re.UNICODE))
 
     app.add_handler(MessageHandler(cyrillic_command("отч[её]т"), cmd_report))
+    app.add_handler(MessageHandler(cyrillic_command("тест_отч[её]т"), cmd_test_report))
     app.add_handler(MessageHandler(cyrillic_command("целевые"), cmd_targets))
     app.add_handler(MessageHandler(cyrillic_command("топ"), cmd_top))
     app.add_handler(MessageHandler(cyrillic_command("флоп"), cmd_flop))
