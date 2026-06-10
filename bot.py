@@ -31,6 +31,7 @@ MY_ID = int(os.environ.get("MY_ID", "642291500"))
 AD_ACCOUNT = os.environ.get("AD_ACCOUNT", "act_1322638451268170")
 META_ACCESS_TOKEN = os.environ["META_ACCESS_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+BITRIX_WEBHOOK = os.environ["BITRIX_WEBHOOK"].rstrip("/")
 
 TZ = timezone(timedelta(hours=5))       # UTC+5 для datetime-вычислений
 TZ_NAME = "Asia/Almaty"                 # для APScheduler
@@ -188,6 +189,82 @@ def set_ad_status(ad_id: str, status: str) -> None:
 def fetch_month_spend() -> float:
     insights = fetch_insights(date_preset="this_month")
     return insights["spend"]
+
+
+# --- Bitrix24 CRM ---
+
+def _bitrix_date_range(date_preset: str) -> tuple[str, str]:
+    """Возвращает (date_from, date_to) для фильтрации в Bitrix24."""
+    now = datetime.now(TZ)
+    if date_preset == "yesterday":
+        d = now - timedelta(days=1)
+    else:
+        d = now
+    start = d.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = d.replace(hour=23, minute=59, second=59, microsecond=0)
+    fmt = "%Y-%m-%dT%H:%M:%S"
+    return start.strftime(fmt), end.strftime(fmt)
+
+
+def fetch_bitrix_leads(date_preset: str = "today") -> dict:
+    """Возвращает лиды из Bitrix24 за нужный период."""
+    date_from, date_to = _bitrix_date_range(date_preset)
+    params = {
+        "filter[>=DATE_CREATE]": date_from,
+        "filter[<=DATE_CREATE]": date_to,
+        "select[]": ["ID", "DATE_CREATE", "STATUS_ID", "SOURCE_ID", "UTM_SOURCE", "TITLE"],
+        "start": 0,
+    }
+    resp = requests.get(f"{BITRIX_WEBHOOK}/crm.lead.list", params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    leads = data.get("result", [])
+
+    # Считаем по статусам
+    status_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
+    for lead in leads:
+        st = lead.get("STATUS_ID", "UNKNOWN")
+        status_counts[st] = status_counts.get(st, 0) + 1
+        src = lead.get("UTM_SOURCE") or lead.get("SOURCE_ID") or "Не указан"
+        source_counts[src] = source_counts.get(src, 0) + 1
+
+    return {
+        "total": len(leads),
+        "by_status": status_counts,
+        "by_source": source_counts,
+    }
+
+
+def fetch_bitrix_deals(date_preset: str = "today") -> dict:
+    """Возвращает сделки из Bitrix24 за нужный период."""
+    date_from, date_to = _bitrix_date_range(date_preset)
+    params = {
+        "filter[>=DATE_CREATE]": date_from,
+        "filter[<=DATE_CREATE]": date_to,
+        "select[]": ["ID", "DATE_CREATE", "STAGE_ID", "OPPORTUNITY", "CURRENCY_ID", "TITLE"],
+        "start": 0,
+    }
+    resp = requests.get(f"{BITRIX_WEBHOOK}/crm.deal.list", params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    deals = data.get("result", [])
+
+    total_amount = sum(float(d.get("OPPORTUNITY") or 0) for d in deals)
+    stage_counts: dict[str, int] = {}
+    closed = 0
+    for deal in deals:
+        st = deal.get("STAGE_ID", "UNKNOWN")
+        stage_counts[st] = stage_counts.get(st, 0) + 1
+        if st in ("WON", "C1:WON"):  # Bitrix стадия «Успешно»
+            closed += 1
+
+    return {
+        "total": len(deals),
+        "closed": closed,
+        "total_amount": total_amount,
+        "by_stage": stage_counts,
+    }
 
 
 # --- Вспомогательные функции по конверсии ---
@@ -623,39 +700,107 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Планировщик ---
 
 def build_morning_report() -> str:
-    """Формирует отчёт за вчерашний день в фиксированном текстовом формате."""
+    """Формирует отчёт за вчерашний день: Meta Ads + Bitrix24 CRM."""
     yesterday_date = (datetime.now(TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # Meta данные
     insights = fetch_insights(date_preset="yesterday")
     ads = fetch_ads_breakdown(date_preset="yesterday")
-
     spend = insights["spend"]
-    leads = insights["leads"]
+    meta_leads = insights["leads"]
     cost_per_lead = insights["cost_per_lead"]
 
     with_leads = [a for a in ads if a["leads"] > 0]
     spenders = [a for a in ads if a["spend"] > 0]
-
     if with_leads:
         best = min(with_leads, key=lambda a: a["cost_per_lead"])
         best_line = f"{best['name']} — ${best['cost_per_lead']:.2f} за заявку"
     else:
         best_line = "нет объявлений с заявками"
 
-    if spenders:
-        worst = max(spenders, key=lambda a: (a["cost_per_lead"] or float("inf")))
-        worst_val = f"${worst['cost_per_lead']:.2f} за заявку" if worst["cost_per_lead"] else "потратило без заявок"
-        worst_line = f"{worst['name']} — {worst_val}"
-    else:
-        worst_line = "нет расходов"
+    # Bitrix данные
+    try:
+        crm_leads = fetch_bitrix_leads(date_preset="yesterday")
+        crm_deals = fetch_bitrix_deals(date_preset="yesterday")
+        bitrix_total = crm_leads["total"]
+        bitrix_closed = crm_deals["closed"]
+        conversion = round(bitrix_total / meta_leads * 100) if meta_leads else 0
+        cost_per_crm_lead = round(spend / bitrix_total, 2) if bitrix_total else 0
+        crm_block = (
+            "--- CRM Bitrix ---\n"
+            f"Новых лидов: {bitrix_total}\n"
+            f"Сделок закрыто: {bitrix_closed}\n"
+            f"Конверсия реклама → лид: {conversion}%\n"
+            f"Цена целевого лида: ${cost_per_crm_lead}"
+        )
+    except Exception:
+        logger.exception("Bitrix недоступен при формировании отчёта")
+        crm_block = "--- CRM Bitrix ---\nДанные недоступны"
 
     return (
         f"Отчёт Автоквартал — {yesterday_date}\n"
+        f"--- Реклама Meta ---\n"
         f"Потрачено: ${spend:.2f}\n"
-        f"Заявок: {leads}\n"
+        f"Заявок из рекламы: {meta_leads}\n"
         f"Цена заявки: ${cost_per_lead:.2f}\n"
-        f"Лучшее объявление: {best_line}\n"
-        f"Слабое объявление: {worst_line}"
+        f"{crm_block}\n"
+        f"--- Лучшее объявление: {best_line}"
     )
+
+
+async def cmd_crm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Текущие лиды и сделки за сегодня из Bitrix24."""
+    try:
+        leads = fetch_bitrix_leads(date_preset="today")
+        deals = fetch_bitrix_deals(date_preset="today")
+
+        status_lines = "\n".join(f"  {st}: {cnt}" for st, cnt in leads["by_status"].items()) or "  нет данных"
+        stage_lines = "\n".join(f"  {st}: {cnt}" for st, cnt in deals["by_stage"].items()) or "  нет данных"
+
+        text = (
+            f"CRM Bitrix — {today_str()}\n\n"
+            f"Лидов сегодня: {leads['total']}\n"
+            f"По статусам:\n{status_lines}\n\n"
+            f"Сделок сегодня: {deals['total']}\n"
+            f"Закрыто (WON): {deals['closed']}\n"
+            f"Сумма сделок: {deals['total_amount']:,.0f}\n"
+            f"По стадиям:\n{stage_lines}"
+        )
+        await update.message.reply_text(text)
+    except Exception:
+        logger.exception("Ошибка /crm")
+        await update.message.reply_text("Не удалось получить данные из Bitrix24. Проверь BITRIX_WEBHOOK.")
+
+
+async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Конверсия по этапам воронки за сегодня."""
+    try:
+        meta = fetch_insights(date_preset="today")
+        leads = fetch_bitrix_leads(date_preset="today")
+        deals = fetch_bitrix_deals(date_preset="today")
+
+        meta_leads = meta["leads"]
+        crm_leads = leads["total"]
+        crm_deals = deals["total"]
+        crm_closed = deals["closed"]
+
+        def pct(a, b):
+            return f"{round(a / b * 100)}%" if b else "н/д"
+
+        lines = [
+            f"Воронка Автоквартал — {today_str()}",
+            "",
+            f"Клики в рекламе → Заявки Meta:  {pct(meta_leads, meta_leads)} ({meta_leads} шт.)",
+            f"Заявки Meta → Лиды в CRM:       {pct(crm_leads, meta_leads)} ({crm_leads} из {meta_leads})",
+            f"Лиды → Сделки:                  {pct(crm_deals, crm_leads)} ({crm_deals} из {crm_leads})",
+            f"Сделки → Закрыто (WON):         {pct(crm_closed, crm_deals)} ({crm_closed} из {crm_deals})",
+            "",
+            f"Итог: реклама → продажа         {pct(crm_closed, meta_leads)}",
+        ]
+        await update.message.reply_text("\n".join(lines))
+    except Exception:
+        logger.exception("Ошибка /воронка")
+        await update.message.reply_text("Не удалось получить данные. Проверь Meta и Bitrix.")
 
 
 async def send_morning_report(app: Application):
@@ -703,6 +848,8 @@ def main():
     app.add_handler(MessageHandler(cyrillic_command("флоп"), cmd_flop))
     app.add_handler(MessageHandler(cyrillic_command("бюджет"), cmd_budget))
     app.add_handler(MessageHandler(cyrillic_command("конверсия"), cmd_conversion))
+    app.add_handler(MessageHandler(cyrillic_command("crm"), cmd_crm))
+    app.add_handler(MessageHandler(cyrillic_command("воронка"), cmd_funnel))
     app.add_handler(MessageHandler(owner_confirmation_filter, handle_owner_confirmation))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
