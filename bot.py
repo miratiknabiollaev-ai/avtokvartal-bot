@@ -261,16 +261,12 @@ def fetch_bitrix_leads(date_preset: str = "today") -> dict:
     }
 
 
-def _fetch_all_deals(extra_filter: dict) -> list[dict]:
-    """Выгружает все страницы сделок с заданным фильтром."""
+def _fetch_all_deals(base_params: list) -> list[dict]:
+    """Выгружает все страницы сделок. base_params — список кортежей (key, value)."""
     result = []
     start = 0
     while True:
-        params = {
-            "select[]": ["ID", "DATE_CREATE", "CLOSEDATE", "STAGE_ID", "OPPORTUNITY", "SOURCE_ID"],
-            "start": start,
-            **extra_filter,
-        }
+        params = base_params + [("start", start)]
         resp = requests.get(f"{BITRIX_WEBHOOK}/crm.deal.list", params=params, timeout=30)
         resp.raise_for_status()
         batch = resp.json().get("result", [])
@@ -285,22 +281,31 @@ def fetch_bitrix_deals(date_preset: str = "today") -> dict:
     """Сделки Instagram/WhatsApp за период: созданные + закрытые (по CLOSEDATE)."""
     date_from, date_to = _bitrix_date_range(date_preset)
 
-    # Сделки, созданные в периоде (из нужных источников — фильтруем на клиенте)
-    created = _fetch_all_deals({
-        "filter[>=DATE_CREATE]": date_from,
-        "filter[<=DATE_CREATE]": date_to,
-    })
-    target_created = [d for d in created if d.get("SOURCE_ID") in INSTAGRAM_WHATSAPP_SOURCES]
-
-    # Сделки, закрытые (WON) в периоде — по CLOSEDATE, тоже только нужные источники
-    closed_deals = _fetch_all_deals({
-        "filter[>=CLOSEDATE]": date_from,
-        "filter[<=CLOSEDATE]": date_to,
-    })
-    target_closed = [
-        d for d in closed_deals
-        if d.get("SOURCE_ID") in INSTAGRAM_WHATSAPP_SOURCES and "WON" in (d.get("STAGE_ID") or "")
+    select_fields = [
+        ("select[]", "ID"),
+        ("select[]", "DATE_CREATE"),
+        ("select[]", "CLOSEDATE"),
+        ("select[]", "STAGE_ID"),
+        ("select[]", "OPPORTUNITY"),
+        ("select[]", "SOURCE_ID"),
     ]
+    # SOURCE_ID фильтр на уровне API (список кортежей — requests не кодирует повторяющиеся ключи)
+    source_filter = [("filter[SOURCE_ID][]", sid) for sid in INSTAGRAM_WHATSAPP_SOURCES]
+
+    # Сделки, созданные в периоде из нужных источников
+    created_params = [
+        ("filter[>=DATE_CREATE]", date_from),
+        ("filter[<=DATE_CREATE]", date_to),
+    ] + source_filter + select_fields
+    target_created = _fetch_all_deals(created_params)
+
+    # Сделки, закрытые (WON) в периоде — по CLOSEDATE
+    closed_params = [
+        ("filter[>=CLOSEDATE]", date_from),
+        ("filter[<=CLOSEDATE]", date_to),
+    ] + source_filter + select_fields
+    all_closed = _fetch_all_deals(closed_params)
+    target_closed = [d for d in all_closed if "WON" in (d.get("STAGE_ID") or "")]
 
     closed_amount = sum(float(d.get("OPPORTUNITY") or 0) for d in target_closed)
 
