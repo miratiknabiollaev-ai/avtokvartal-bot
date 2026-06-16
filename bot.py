@@ -238,6 +238,87 @@ def fetch_ads_breakdown(date_preset: str = "today", time_range: dict | None = No
     return ads
 
 
+def fetch_campaigns_breakdown(time_range: dict) -> list[dict]:
+    """Данные по кампаниям с разбивкой по объявлениям.
+
+    Возвращает список кампаний:
+      {
+        "campaign_id": str,
+        "campaign_name": str,
+        "spend": float,
+        "leads": int,
+        "cost_per_lead": float | None,
+        "ads": [{"name": str, "spend": float, "leads": int, "cost_per_lead": float|None}, ...]
+      }
+    """
+    # Сначала берём данные уровня campaign
+    camp_params: dict = {
+        "access_token": META_ACCESS_TOKEN,
+        "fields": "campaign_id,campaign_name,spend,actions",
+        "level": "campaign",
+        "limit": 100,
+        "time_range": json.dumps(time_range),
+    }
+    resp = requests.get(f"{GRAPH_API_URL}/{AD_ACCOUNT}/insights", params=camp_params, timeout=30)
+    resp.raise_for_status()
+    camp_rows = resp.json().get("data", [])
+
+    # Данные уровня ad с campaign_id для группировки
+    ad_params: dict = {
+        "access_token": META_ACCESS_TOKEN,
+        "fields": "campaign_id,campaign_name,ad_id,ad_name,spend,actions",
+        "level": "ad",
+        "limit": 100,
+        "time_range": json.dumps(time_range),
+    }
+    resp2 = requests.get(f"{GRAPH_API_URL}/{AD_ACCOUNT}/insights", params=ad_params, timeout=30)
+    resp2.raise_for_status()
+    ad_rows = resp2.json().get("data", [])
+
+    def extract_leads(row: dict) -> int:
+        leads = 0
+        for action in row.get("actions", []):
+            if action.get("action_type") in (
+                "onsite_conversion.messaging_conversation_started_7d",
+                "messaging_conversation_started_7d",
+            ):
+                leads += int(float(action.get("value", 0)))
+        return leads
+
+    # Строим словарь campaign_id → ads
+    ads_by_camp: dict[str, list] = {}
+    for row in ad_rows:
+        cid = row.get("campaign_id", "unknown")
+        spend = float(row.get("spend", 0))
+        leads = extract_leads(row)
+        ads_by_camp.setdefault(cid, []).append({
+            "name": row.get("ad_name", "Без названия"),
+            "spend": spend,
+            "leads": leads,
+            "cost_per_lead": (spend / leads) if leads else None,
+        })
+
+    campaigns = []
+    for row in camp_rows:
+        cid = row.get("campaign_id", "unknown")
+        spend = float(row.get("spend", 0))
+        leads = extract_leads(row)
+        campaigns.append({
+            "campaign_id": cid,
+            "campaign_name": row.get("campaign_name", "Без названия"),
+            "spend": spend,
+            "leads": leads,
+            "cost_per_lead": (spend / leads) if leads else None,
+            "ads": sorted(
+                ads_by_camp.get(cid, []),
+                key=lambda a: a["spend"],
+                reverse=True,
+            ),
+        })
+
+    return sorted(campaigns, key=lambda c: c["spend"], reverse=True)
+
+
 def set_ad_status(ad_id: str, status: str) -> None:
     """Меняет статус объявления в Meta Ads (например, ставит на паузу)."""
     resp = requests.post(
@@ -807,61 +888,142 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Планировщик ---
 
+def _build_recommendations(campaigns: list[dict], usd_rate: float) -> str:
+    """Генерирует рекомендации через Claude API на основе данных по кампаниям."""
+    # Подготавливаем краткую сводку для Claude
+    summary_lines = []
+    for c in campaigns:
+        cpl = f"${c['cost_per_lead']:.2f}" if c["cost_per_lead"] else "нет заявок"
+        summary_lines.append(
+            f"Кампания «{c['campaign_name']}»: потрачено ${c['spend']:.2f}, "
+            f"заявок {c['leads']}, цена заявки {cpl}"
+        )
+        for a in c["ads"][:3]:
+            acpl = f"${a['cost_per_lead']:.2f}" if a["cost_per_lead"] else "нет заявок"
+            summary_lines.append(
+                f"  Объявление «{a['name']}»: ${a['spend']:.2f}, {a['leads']} заявок, {acpl}"
+            )
+
+    prompt = (
+        "Данные по рекламным кампаниям Meta Ads за вчера:\n"
+        + "\n".join(summary_lines)
+        + "\n\nДай краткие рекомендации в формате:\n"
+        "Отключить: [название] — [причина в 5 словах]\n"
+        "Масштабировать: [название] — [причина в 5 словах]\n\n"
+        "Только факты. Максимум 3 пункта. Без вводных слов."
+    )
+    try:
+        msg = claude_client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return msg.content[0].text.strip()
+    except Exception:
+        logger.exception("Claude API недоступен для рекомендаций")
+        return "Рекомендации недоступны"
+
+
 def build_morning_report() -> str:
-    """Формирует отчёт за вчерашний день: Meta Ads + Bitrix24 CRM.
+    """Развёрнутый отчёт за вчерашний день: Meta Ads (по кампаниям) + Bitrix24 + ДРР.
 
     ВАЖНО: используем явные даты since/until в Asia/Almaty вместо date_preset="yesterday",
     так как Railway работает в UTC и Meta API считал бы "вчера" не по Алматы.
     """
     since, until = get_yesterday_almaty()
-    yesterday_date = since
     time_range = {"since": since, "until": until}
     logger.info("build_morning_report: time_range=%s", time_range)
 
-    # Meta данные — явные даты по Алматы
+    usd_rate = float(os.environ.get("USD_KZT_RATE", "450"))
+
+    # ── Meta данные ──────────────────────────────────────────────────────────
     insights = fetch_insights(time_range=time_range)
-    ads = fetch_ads_breakdown(time_range=time_range)
     spend = insights["spend"]
     meta_leads = insights["leads"]
     cost_per_lead = insights["cost_per_lead"]
 
-    with_leads = [a for a in ads if a["leads"] > 0]
-    spenders = [a for a in ads if a["spend"] > 0]
-    if with_leads:
-        best = min(with_leads, key=lambda a: a["cost_per_lead"])
-        best_line = f"{best['name']} — ${best['cost_per_lead']:.2f} за заявку"
-    else:
-        best_line = "нет объявлений с заявками"
+    campaigns = fetch_campaigns_breakdown(time_range=time_range)
 
-    # Bitrix данные — тот же time_range что и Meta (единый период по Алматы)
-    try:
-        crm_deals = fetch_bitrix_deals(time_range=time_range)
-        deals_total = crm_deals["total"]
-        deals_closed = crm_deals["closed"]
-        closed_amount = crm_deals["closed_amount"]
-        conv_to_deal = round(deals_total / meta_leads * 100) if meta_leads else 0
-        cost_per_client = round(spend / deals_closed, 2) if deals_closed else 0
-        crm_block = (
-            "--- CRM Bitrix (Instagram + WhatsApp) ---\n"
-            f"Новых сделок: {deals_total}\n"
-            f"Закрытых сделок: {deals_closed}\n"
-            f"Сумма закрытых: {closed_amount:,.0f} тг\n"
-            f"Конверсия заявка → сделка: {conv_to_deal}%\n"
-            f"Цена реального покупателя: ${cost_per_client}"
+    # ── Кампании: блок текста ─────────────────────────────────────────────────
+    camp_lines = []
+    for c in campaigns:
+        if c["spend"] == 0:
+            continue
+        cpl = f"${c['cost_per_lead']:.2f}" if c["cost_per_lead"] else "нет заявок"
+        camp_lines.append(
+            f"\n{c['campaign_name']}\n"
+            f"Потрачено: ${c['spend']:.2f} | Заявок: {c['leads']} | Цена: {cpl}"
         )
+        for i, a in enumerate(c["ads"][:5], 1):
+            if a["spend"] == 0:
+                continue
+            acpl = f"${a['cost_per_lead']:.2f}" if a["cost_per_lead"] else "нет заявок"
+            camp_lines.append(f"  кр {i} — {a['name']}: ${a['spend']:.2f} | {a['leads']} заявок | {acpl}")
+
+    camp_block = "\n".join(camp_lines) if camp_lines else "нет данных"
+
+    # ── Рекомендации от Claude ────────────────────────────────────────────────
+    recommendations = _build_recommendations(campaigns, usd_rate)
+
+    # ── Bitrix данные ─────────────────────────────────────────────────────────
+    try:
+        crm = fetch_bitrix_deals(time_range=time_range)
+        deals_total = crm["total"]
+        deals_closed = crm["closed"]
+        closed_amount = crm["closed_amount"]
     except Exception:
         logger.exception("Bitrix недоступен при формировании отчёта")
-        crm_block = "--- CRM Bitrix (Instagram + WhatsApp) ---\nДанные недоступны"
+        deals_total = deals_closed = 0
+        closed_amount = 0.0
 
-    return (
-        f"Отчёт Автоквартал — {yesterday_date}\n"
-        f"--- Реклама Meta ---\n"
-        f"Потрачено: ${spend:.2f}\n"
-        f"Заявок из рекламы: {meta_leads}\n"
-        f"Цена заявки: ${cost_per_lead:.2f}\n"
-        f"{crm_block}\n"
-        f"--- Лучшее объявление: {best_line}"
-    )
+    # ── Воронка ───────────────────────────────────────────────────────────────
+    def pct(a: int, b: int) -> str:
+        return f"{round(a / b * 100)}%" if b else "н/д"
+
+    conv_to_deal = pct(deals_total, meta_leads)
+    conv_to_close = pct(deals_closed, deals_total)
+
+    # ── ДРР ──────────────────────────────────────────────────────────────────
+    spend_kzt = spend * usd_rate
+    drr = round(spend_kzt / closed_amount * 100, 1) if closed_amount else 0.0
+    drr_status = "✅ норма" if drr <= 20 else "⚠️ выше нормы"
+
+    # ── Цена покупателя ───────────────────────────────────────────────────────
+    cost_per_client = round(spend / deals_closed, 2) if deals_closed else 0
+
+    lines = [
+        f"Отчёт Автоквартал — {since}",
+        "",
+        "ОБЩИЙ ИТОГ",
+        f"Потрачено: ${spend:.2f}",
+        f"Заявок из рекламы: {meta_leads}",
+        f"Цена заявки: ${cost_per_lead:.2f}",
+        "",
+        "ПО КАМПАНИЯМ",
+        camp_block,
+        "",
+        "РЕКОМЕНДАЦИИ",
+        recommendations,
+        "",
+        "CRM BITRIX (Instagram + WhatsApp)",
+        f"Новых сделок за день: {deals_total}",
+        f"Закрытых продаж: {deals_closed}",
+        f"Выручка: {closed_amount:,.0f} тг",
+        "",
+        "ВОРОНКА",
+        f"Реклама → {meta_leads} заявок",
+        f"Заявка → сделка: {conv_to_deal} ({deals_total} из {meta_leads})",
+        f"Закрыто: {conv_to_close} ({deals_closed} из {deals_total})",
+        "",
+        "ДРР (доля рекламных расходов)",
+        f"Потрачено на рекламу: ${spend:.2f} ({spend_kzt:,.0f} тг)",
+        f"Выручка: {closed_amount:,.0f} тг",
+        f"ДРР: {drr}% ({drr_status}, норма до 20%)",
+        "",
+        "ИТОГ",
+        f"Цена реального покупателя: ${cost_per_client}",
+    ]
+    return "\n".join(lines)
 
 
 async def cmd_crm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1009,7 +1171,7 @@ def main():
     app.add_handler(MessageHandler(owner_confirmation_filter, handle_owner_confirmation))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("Бот запускается... [v490b367 — SOURCE_ID fix + detect_period fix]")
+    logger.info("Бот запускается... [v5949059 — расширенный утренний отчёт + ДРР + Claude рекомендации]")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
