@@ -1009,7 +1009,7 @@ def main():
     app.add_handler(MessageHandler(owner_confirmation_filter, handle_owner_confirmation))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("Бот запускается...")
+    logger.info("Бот запускается... [v490b367 — SOURCE_ID fix + detect_period fix]")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
