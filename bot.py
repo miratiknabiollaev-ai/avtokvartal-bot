@@ -145,16 +145,20 @@ def detect_period(text: str) -> tuple[str, str]:
     preset — строка: 'yesterday' | 'today' | 'last_7d' | 'last_30d'
     Используется как ключ для get_period_almaty(), НЕ передаётся в Meta date_preset напрямую.
     """
+    logger.info("detect_period input: '%s'", text)
     t = (text or "").lower()
     if "вчера" in t or "yesterday" in t:
-        return "yesterday", "вчера"
-    if "недел" in t or "week" in t:
-        return "last_7d", "последние 7 дней"
-    if "месяц" in t or "month" in t:
-        return "last_30d", "последние 30 дней"
-    if "сегодня" in t or "today" in t:
-        return "today", "сегодня"
-    return "today", "сегодня"
+        result = ("yesterday", "вчера")
+    elif "недел" in t or "week" in t:
+        result = ("last_7d", "последние 7 дней")
+    elif "месяц" in t or "month" in t:
+        result = ("last_30d", "последние 30 дней")
+    elif "сегодня" in t or "today" in t:
+        result = ("today", "сегодня")
+    else:
+        result = ("today", "сегодня")
+    logger.info("detect_period result: preset='%s', label='%s'", result[0], result[1])
+    return result
 
 
 def fetch_insights(date_preset: str = "today", time_range: dict | None = None) -> dict:
