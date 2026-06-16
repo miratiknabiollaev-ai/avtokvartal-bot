@@ -256,13 +256,15 @@ def fetch_month_spend() -> float:
 # --- Bitrix24 CRM ---
 
 # Целевые источники сделок из Instagram и WhatsApp (названия каналов в Bitrix24)
+# SOURCE_ID коды из справочника Bitrix24 (crm.status.list ENTITY_ID=SOURCE)
+# Человекочитаемые имена → внутренние коды
 INSTAGRAM_WHATSAPP_SOURCES = [
-    "Звонок - Instagram - 2800",
-    "Instagram - korea_avtokvartal_parts",
-    "WhatsApp - Instagram",
-    "WA - Facebook - Реклама",
-    "Instagram Direct Korean",
-    "Instagram Direct",
+    "UC_OSEFPC",                                          # Звонок - Instagram - 2800
+    "1|WZ_INSTAGRAM_AEB15A4F4755E07FF47B57CF8189EC10",   # Instagram - korea_avtokvartal_parts
+    "1|UMNICO_WHATSAPP-81824",                            # WhatsApp - Instagram
+    "UC_OSGY4N",                                          # WA - Facebook - Реклама
+    "22",                                                 # Instagram Direct Korean
+    "1|FBINSTAGRAMDIRECT",                                # Instagram Direct
 ]
 
 
