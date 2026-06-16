@@ -903,9 +903,14 @@ async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     preset, label = detect_period(text)
 
-    # Если пользователь написал просто "воронка" без уточнения — 7 дней
-    t = text.lower()
-    if preset == "today" and "сегодня" not in t and "today" not in t:
+    # Если написали просто "воронка" (без уточнения периода) — дефолт 7 дней.
+    # Если написали "воронка за вчера/неделю/месяц" — detect_period уже вернул нужный preset.
+    if (
+        preset == "today"
+        and "сегодня" not in text.lower()
+        and "воронка" in text.lower()
+        and len(text.strip()) <= 7
+    ):
         preset, label = "last_7d", "последние 7 дней"
 
     since, until = get_period_almaty(preset)
