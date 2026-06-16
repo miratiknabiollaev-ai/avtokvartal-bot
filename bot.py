@@ -4,6 +4,7 @@ import json
 import asyncio
 import logging
 from datetime import datetime, date, timezone, timedelta
+import pytz
 
 import requests
 from telegram import Update
@@ -109,6 +110,17 @@ def today_str() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d")
 
 
+def get_yesterday_almaty() -> tuple[str, str]:
+    """Возвращает (since, until) за вчера строго по Asia/Almaty (UTC+5).
+    Используем pytz чтобы избежать смещения UTC на Railway.
+    """
+    almaty_tz = pytz.timezone("Asia/Almaty")
+    now_almaty = datetime.now(almaty_tz)
+    yesterday = now_almaty - timedelta(days=1)
+    d = yesterday.strftime("%Y-%m-%d")
+    return d, d
+
+
 def detect_period(text: str) -> tuple[str, str]:
     """Определяет период по тексту сообщения: (date_preset для Meta API, человекочитаемая подпись)."""
     t = (text or "").lower()
@@ -121,13 +133,21 @@ def detect_period(text: str) -> tuple[str, str]:
     return "today", "сегодня"
 
 
-def fetch_insights(date_preset: str = "today") -> dict:
-    """Берёт суммарные данные по аккаунту: затраты, лиды (сообщения WhatsApp), цена за лид."""
-    params = {
+def fetch_insights(date_preset: str = "today", time_range: dict | None = None) -> dict:
+    """Берёт суммарные данные по аккаунту: затраты, лиды (сообщения WhatsApp), цена за лид.
+
+    Если передан time_range={"since": "YYYY-MM-DD", "until": "YYYY-MM-DD"} — используем его
+    вместо date_preset, чтобы Meta API не считал "вчера" по UTC сервера Railway.
+    """
+    params: dict = {
         "access_token": META_ACCESS_TOKEN,
         "fields": "spend,actions,cost_per_action_type",
-        "date_preset": date_preset,
     }
+    if time_range:
+        params["time_range"] = json.dumps(time_range)
+    else:
+        params["date_preset"] = date_preset
+
     resp = requests.get(f"{GRAPH_API_URL}/{AD_ACCOUNT}/insights", params=params, timeout=30)
     resp.raise_for_status()
     data = resp.json().get("data", [])
@@ -138,22 +158,33 @@ def fetch_insights(date_preset: str = "today") -> dict:
     spend = float(row.get("spend", 0))
     leads = 0
     for action in row.get("actions", []):
-        if action.get("action_type") in ("onsite_conversion.messaging_conversation_started_7d", "messaging_conversation_started_7d"):
+        if action.get("action_type") in (
+            "onsite_conversion.messaging_conversation_started_7d",
+            "messaging_conversation_started_7d",
+        ):
             leads += int(float(action.get("value", 0)))
 
     cost_per_lead = (spend / leads) if leads else 0.0
     return {"spend": spend, "leads": leads, "cost_per_lead": cost_per_lead}
 
 
-def fetch_ads_breakdown(date_preset: str = "today") -> list[dict]:
-    """Возвращает список объявлений с затратами, лидами и ценой за лид."""
-    params = {
+def fetch_ads_breakdown(date_preset: str = "today", time_range: dict | None = None) -> list[dict]:
+    """Возвращает список объявлений с затратами, лидами и ценой за лид.
+
+    Если передан time_range={"since": "YYYY-MM-DD", "until": "YYYY-MM-DD"} — используем его
+    вместо date_preset, чтобы Meta API не считал "вчера" по UTC сервера Railway.
+    """
+    params: dict = {
         "access_token": META_ACCESS_TOKEN,
         "fields": "ad_id,ad_name,spend,actions",
-        "date_preset": date_preset,
         "level": "ad",
         "limit": 100,
     }
+    if time_range:
+        params["time_range"] = json.dumps(time_range)
+    else:
+        params["date_preset"] = date_preset
+
     resp = requests.get(f"{GRAPH_API_URL}/{AD_ACCOUNT}/insights", params=params, timeout=30)
     resp.raise_for_status()
     data = resp.json().get("data", [])
@@ -163,7 +194,10 @@ def fetch_ads_breakdown(date_preset: str = "today") -> list[dict]:
         spend = float(row.get("spend", 0))
         leads = 0
         for action in row.get("actions", []):
-            if action.get("action_type") in ("onsite_conversion.messaging_conversation_started_7d", "messaging_conversation_started_7d"):
+            if action.get("action_type") in (
+                "onsite_conversion.messaging_conversation_started_7d",
+                "messaging_conversation_started_7d",
+            ):
                 leads += int(float(action.get("value", 0)))
         cost_per_lead = (spend / leads) if leads else None
         ads.append({
@@ -193,31 +227,31 @@ def fetch_month_spend() -> float:
 
 # --- Bitrix24 CRM ---
 
-# SOURCE_ID сделок из Instagram и WhatsApp (выявлены анализом базы)
-INSTAGRAM_WHATSAPP_SOURCES = {
-    "1|FBINSTAGRAMDIRECT",
-    "1|WZ_INSTAGRAM_AEB15A4F4755E07FF47B57CF8189EC10",
-    "1|UMNICO_WHATSAPP-81824",
-    "WZda34e12c-90ad-400d-aaa7-e020f7d65558",
-    "UC_JI402S",
-    "UC_KT0AKH",
-    "UC_QZCZNF",
-    "UC_GMDJR5",
-    "UC_DMZQU9",
-    "UC_A8932L",
-    "UC_OSEFPC",
-}
+# Целевые источники сделок из Instagram и WhatsApp (названия каналов в Bitrix24)
+INSTAGRAM_WHATSAPP_SOURCES = [
+    "Звонок - Instagram - 2800",
+    "Instagram - korea_avtokvartal_parts",
+    "WhatsApp - Instagram",
+    "WA - Facebook - Реклама",
+    "Instagram Direct Korean",
+    "Instagram Direct",
+]
 
 
 def _bitrix_date_range(date_preset: str) -> tuple[str, str]:
-    """Возвращает (date_from, date_to) для фильтрации в Bitrix24."""
-    now = datetime.now(TZ)
+    """Возвращает (date_from, date_to) для фильтрации в Bitrix24.
+
+    Даты вычисляются строго в Asia/Almaty (UTC+5) через pytz,
+    чтобы не зависеть от часового пояса сервера Railway (UTC).
+    """
+    almaty_tz = pytz.timezone("Asia/Almaty")
+    now = datetime.now(almaty_tz)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    fmt = "%Y-%m-%dT%H:%M:%S"
 
     if date_preset == "yesterday":
-        start = today_start - timedelta(days=1)
-        end = today_start - timedelta(seconds=1)
+        yesterday = today_start - timedelta(days=1)
+        start = yesterday
+        end = yesterday.replace(hour=23, minute=59, second=59)
     elif date_preset == "last_7d":
         start = today_start - timedelta(days=7)
         end = now
@@ -228,6 +262,7 @@ def _bitrix_date_range(date_preset: str) -> tuple[str, str]:
         start = today_start
         end = now
 
+    fmt = "%Y-%m-%dT%H:%M:%S"
     return start.strftime(fmt), end.strftime(fmt)
 
 
@@ -288,9 +323,14 @@ def fetch_bitrix_deals(date_preset: str = "today") -> dict:
         ("select[]", "STAGE_ID"),
         ("select[]", "OPPORTUNITY"),
         ("select[]", "SOURCE_ID"),
+        ("select[]", "UTM_SOURCE"),
     ]
-    # SOURCE_ID фильтр на уровне API (список кортежей — requests не кодирует повторяющиеся ключи)
-    source_filter = [("filter[SOURCE_ID][]", sid) for sid in INSTAGRAM_WHATSAPP_SOURCES]
+    # Фильтр по целевым источникам (Instagram/WhatsApp каналы по имени)
+    # Используем indexed array notation для Bitrix24 REST API
+    source_filter = [
+        (f"filter[SOURCE_ID][{i}]", src)
+        for i, src in enumerate(INSTAGRAM_WHATSAPP_SOURCES)
+    ]
 
     # Сделки, созданные в периоде из нужных источников
     created_params = [
@@ -749,12 +789,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Планировщик ---
 
 def build_morning_report() -> str:
-    """Формирует отчёт за вчерашний день: Meta Ads + Bitrix24 CRM."""
-    yesterday_date = (datetime.now(TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
+    """Формирует отчёт за вчерашний день: Meta Ads + Bitrix24 CRM.
 
-    # Meta данные
-    insights = fetch_insights(date_preset="yesterday")
-    ads = fetch_ads_breakdown(date_preset="yesterday")
+    ВАЖНО: используем явные даты since/until в Asia/Almaty вместо date_preset="yesterday",
+    так как Railway работает в UTC и Meta API считал бы "вчера" не по Алматы.
+    """
+    since, until = get_yesterday_almaty()
+    yesterday_date = since
+    time_range = {"since": since, "until": until}
+    logger.info("build_morning_report: time_range=%s", time_range)
+
+    # Meta данные — явные даты по Алматы
+    insights = fetch_insights(time_range=time_range)
+    ads = fetch_ads_breakdown(time_range=time_range)
     spend = insights["spend"]
     meta_leads = insights["leads"]
     cost_per_lead = insights["cost_per_lead"]
