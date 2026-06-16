@@ -916,6 +916,13 @@ async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         crm_closed = deals["closed"]
         closed_amount = deals["closed_amount"]
 
+        # DEBUG — временный лог для проверки периода и данных из Bitrix
+        print(
+            f"DEBUG воронка: preset={preset}, since={since}, until={until}, "
+            f"meta_leads={meta_leads}, bitrix_deals={crm_deals}, bitrix_closed={crm_closed}",
+            flush=True,
+        )
+
         def pct(a, b):
             return f"{round(a / b * 100)}%" if b else "н/д"
 
