@@ -110,19 +110,41 @@ def today_str() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d")
 
 
-def get_yesterday_almaty() -> tuple[str, str]:
-    """Возвращает (since, until) за вчера строго по Asia/Almaty (UTC+5).
-    Используем pytz чтобы избежать смещения UTC на Railway.
+def get_period_almaty(preset: str) -> tuple[str, str]:
+    """Возвращает (since, until) как 'YYYY-MM-DD' строго по Asia/Almaty.
+
+    Единая точка вычисления дат для Meta API и Bitrix24 — оба получают
+    одинаковый диапазон, независимо от UTC-timezone сервера Railway.
+
+    preset: 'yesterday' | 'today' | 'last_7d' | 'last_30d' | 'this_month'
     """
     almaty_tz = pytz.timezone("Asia/Almaty")
-    now_almaty = datetime.now(almaty_tz)
-    yesterday = now_almaty - timedelta(days=1)
-    d = yesterday.strftime("%Y-%m-%d")
-    return d, d
+    today = datetime.now(almaty_tz).date()
+
+    if preset == "yesterday":
+        d = today - timedelta(days=1)
+        return str(d), str(d)
+    if preset == "last_7d":
+        return str(today - timedelta(days=6)), str(today)
+    if preset == "last_30d":
+        return str(today - timedelta(days=29)), str(today)
+    if preset == "this_month":
+        return str(today.replace(day=1)), str(today)
+    # today
+    return str(today), str(today)
+
+
+# Оставляем для обратной совместимости (используется в build_morning_report)
+def get_yesterday_almaty() -> tuple[str, str]:
+    return get_period_almaty("yesterday")
 
 
 def detect_period(text: str) -> tuple[str, str]:
-    """Определяет период по тексту сообщения: (date_preset для Meta API, человекочитаемая подпись)."""
+    """Определяет период по тексту сообщения: (preset, человекочитаемая подпись).
+
+    preset — строка: 'yesterday' | 'today' | 'last_7d' | 'last_30d'
+    Используется как ключ для get_period_almaty(), НЕ передаётся в Meta date_preset напрямую.
+    """
     t = (text or "").lower()
     if "вчера" in t or "yesterday" in t:
         return "yesterday", "вчера"
@@ -130,6 +152,8 @@ def detect_period(text: str) -> tuple[str, str]:
         return "last_7d", "последние 7 дней"
     if "месяц" in t or "month" in t:
         return "last_30d", "последние 30 дней"
+    if "сегодня" in t or "today" in t:
+        return "today", "сегодня"
     return "today", "сегодня"
 
 
@@ -238,37 +262,23 @@ INSTAGRAM_WHATSAPP_SOURCES = [
 ]
 
 
-def _bitrix_date_range(date_preset: str) -> tuple[str, str]:
-    """Возвращает (date_from, date_to) для фильтрации в Bitrix24.
-
-    Даты вычисляются строго в Asia/Almaty (UTC+5) через pytz,
-    чтобы не зависеть от часового пояса сервера Railway (UTC).
+def _time_range_to_bitrix(time_range: dict) -> tuple[str, str]:
+    """Конвертирует time_range {'since': 'YYYY-MM-DD', 'until': 'YYYY-MM-DD'}
+    в строки для Bitrix24 filter: (date_from, date_to).
+    Всегда покрывает полный день с 00:00:00 до 23:59:59.
     """
-    almaty_tz = pytz.timezone("Asia/Almaty")
-    now = datetime.now(almaty_tz)
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    if date_preset == "yesterday":
-        yesterday = today_start - timedelta(days=1)
-        start = yesterday
-        end = yesterday.replace(hour=23, minute=59, second=59)
-    elif date_preset == "last_7d":
-        start = today_start - timedelta(days=7)
-        end = now
-    elif date_preset == "last_30d":
-        start = today_start - timedelta(days=30)
-        end = now
-    else:  # today
-        start = today_start
-        end = now
-
-    fmt = "%Y-%m-%dT%H:%M:%S"
-    return start.strftime(fmt), end.strftime(fmt)
+    since = time_range["since"]
+    until = time_range["until"]
+    return f"{since}T00:00:00", f"{until}T23:59:59"
 
 
-def fetch_bitrix_leads(date_preset: str = "today") -> dict:
-    """Возвращает лиды из Bitrix24 за нужный период."""
-    date_from, date_to = _bitrix_date_range(date_preset)
+def fetch_bitrix_leads(time_range: dict) -> dict:
+    """Возвращает лиды из Bitrix24 за период, заданный явными датами.
+
+    time_range: {"since": "YYYY-MM-DD", "until": "YYYY-MM-DD"}
+    """
+    date_from, date_to = _time_range_to_bitrix(time_range)
+    logger.info("fetch_bitrix_leads: DATE_CREATE %s .. %s", date_from, date_to)
     params = {
         "filter[>=DATE_CREATE]": date_from,
         "filter[<=DATE_CREATE]": date_to,
@@ -277,10 +287,8 @@ def fetch_bitrix_leads(date_preset: str = "today") -> dict:
     }
     resp = requests.get(f"{BITRIX_WEBHOOK}/crm.lead.list", params=params, timeout=30)
     resp.raise_for_status()
-    data = resp.json()
-    leads = data.get("result", [])
+    leads = resp.json().get("result", [])
 
-    # Считаем по статусам
     status_counts: dict[str, int] = {}
     source_counts: dict[str, int] = {}
     for lead in leads:
@@ -312,9 +320,14 @@ def _fetch_all_deals(base_params: list) -> list[dict]:
     return result
 
 
-def fetch_bitrix_deals(date_preset: str = "today") -> dict:
-    """Сделки Instagram/WhatsApp за период: созданные + закрытые (по CLOSEDATE)."""
-    date_from, date_to = _bitrix_date_range(date_preset)
+def fetch_bitrix_deals(time_range: dict) -> dict:
+    """Сделки Instagram/WhatsApp за период: созданные + закрытые (по CLOSEDATE).
+
+    time_range: {"since": "YYYY-MM-DD", "until": "YYYY-MM-DD"}
+    Тот же time_range что передаётся в Meta API — единый источник правды по периоду.
+    """
+    date_from, date_to = _time_range_to_bitrix(time_range)
+    logger.info("fetch_bitrix_deals: DATE_CREATE %s .. %s", date_from, date_to)
 
     select_fields = [
         ("select[]", "ID"),
@@ -326,7 +339,7 @@ def fetch_bitrix_deals(date_preset: str = "today") -> dict:
         ("select[]", "UTM_SOURCE"),
     ]
     # Фильтр по целевым источникам (Instagram/WhatsApp каналы по имени)
-    # Используем indexed array notation для Bitrix24 REST API
+    # indexed array notation для Bitrix24 REST API
     source_filter = [
         (f"filter[SOURCE_ID][{i}]", src)
         for i, src in enumerate(INSTAGRAM_WHATSAPP_SOURCES)
@@ -814,9 +827,9 @@ def build_morning_report() -> str:
     else:
         best_line = "нет объявлений с заявками"
 
-    # Bitrix данные
+    # Bitrix данные — тот же time_range что и Meta (единый период по Алматы)
     try:
-        crm_deals = fetch_bitrix_deals(date_preset="yesterday")
+        crm_deals = fetch_bitrix_deals(time_range=time_range)
         deals_total = crm_deals["total"]
         deals_closed = crm_deals["closed"]
         closed_amount = crm_deals["closed_amount"]
@@ -847,38 +860,61 @@ def build_morning_report() -> str:
 
 async def cmd_crm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Текущие лиды и сделки за сегодня из Bitrix24."""
+    since, until = get_period_almaty("today")
+    time_range = {"since": since, "until": until}
     try:
-        leads = fetch_bitrix_leads(date_preset="today")
-        deals = fetch_bitrix_deals(date_preset="today")
+        leads = fetch_bitrix_leads(time_range=time_range)
+        deals = fetch_bitrix_deals(time_range=time_range)
 
         status_lines = "\n".join(f"  {st}: {cnt}" for st, cnt in leads["by_status"].items()) or "  нет данных"
-        stage_lines = "\n".join(f"  {st}: {cnt}" for st, cnt in deals["by_stage"].items()) or "  нет данных"
 
-        text = (
-            f"CRM Bitrix — {today_str()}\n\n"
+        msg = (
+            f"CRM Bitrix — {since}\n\n"
             f"Лидов сегодня: {leads['total']}\n"
             f"По статусам:\n{status_lines}\n\n"
-            f"Сделок сегодня: {deals['total']}\n"
+            f"Сделок (Instagram/WhatsApp): {deals['total']}\n"
             f"Закрыто (WON): {deals['closed']}\n"
-            f"Сумма сделок: {deals['total_amount']:,.0f}\n"
-            f"По стадиям:\n{stage_lines}"
+            f"Сумма закрытых: {deals['closed_amount']:,.0f} тг"
         )
-        await update.message.reply_text(text)
+        await update.message.reply_text(msg)
     except Exception:
         logger.exception("Ошибка /crm")
         await update.message.reply_text("Не удалось получить данные из Bitrix24. Проверь BITRIX_WEBHOOK.")
 
 
 async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Конверсия по этапам воронки за последние 7 дней (Instagram + WhatsApp)."""
+    """Конверсия по этапам воронки — период определяется из текста сообщения.
+
+    "воронка"               → последние 7 дней (по умолчанию)
+    "воронка за вчера"      → вчера по Asia/Almaty
+    "воронка за сегодня"    → сегодня
+    "воронка за неделю"     → последние 7 дней
+    "воронка за месяц"      → последние 30 дней
+
+    Оба источника (Meta и Bitrix) используют ОДИНАКОВЫЙ time_range —
+    вычисленный по Asia/Almaty, а не UTC сервера Railway.
+    """
+    text = update.message.text or ""
+    preset, label = detect_period(text)
+
+    # Если пользователь написал просто "воронка" без уточнения — 7 дней
+    t = text.lower()
+    if preset == "today" and "сегодня" not in t and "today" not in t:
+        preset, label = "last_7d", "последние 7 дней"
+
+    since, until = get_period_almaty(preset)
+    time_range = {"since": since, "until": until}
+    logger.info("cmd_funnel: preset=%s time_range=%s", preset, time_range)
+
     try:
-        meta = fetch_insights(date_preset="last_7d")
-        deals = fetch_bitrix_deals(date_preset="last_7d")
+        meta = fetch_insights(time_range=time_range)
+        deals = fetch_bitrix_deals(time_range=time_range)
 
         meta_leads = meta["leads"]
         spend = meta["spend"]
         crm_deals = deals["total"]
         crm_closed = deals["closed"]
+        closed_amount = deals["closed_amount"]
 
         def pct(a, b):
             return f"{round(a / b * 100)}%" if b else "н/д"
@@ -886,15 +922,19 @@ async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cost_per_lead = round(spend / meta_leads, 2) if meta_leads else 0
         cost_per_client = round(spend / crm_closed, 2) if crm_closed else 0
 
+        period_str = f"{since}" if since == until else f"{since} — {until}"
         lines = [
-            f"Воронка Автоквартал — последние 7 дней",
+            f"Воронка Автоквартал — {label}",
+            f"({period_str})",
             f"(Instagram + WhatsApp из CRM)",
             "",
-            f"Реклама → {meta_leads} заявок (${cost_per_lead} каждая)",
-            f"Заявка → сделка: {pct(crm_deals, meta_leads)} ({crm_deals} из {meta_leads})",
-            f"Сделка → закрыта: {pct(crm_closed, crm_deals)} ({crm_closed} из {crm_deals})",
+            f"💰 Потрачено: ${spend:.2f}",
+            f"📩 Реклама → {meta_leads} заявок (${cost_per_lead} каждая)",
+            f"🤝 Заявка → сделка: {pct(crm_deals, meta_leads)} ({crm_deals} из {meta_leads})",
+            f"✅ Сделка → закрыта: {pct(crm_closed, crm_deals)} ({crm_closed} из {crm_deals})",
+            f"💵 Сумма закрытых: {closed_amount:,.0f} тг",
             "",
-            f"Цена реального покупателя: ${cost_per_client}",
+            f"🏆 Цена реального покупателя: ${cost_per_client}",
         ]
         await update.message.reply_text("\n".join(lines))
     except Exception:
