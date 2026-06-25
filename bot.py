@@ -1023,7 +1023,9 @@ def build_morning_report() -> str:
         "ИТОГ",
         f"Цена реального покупателя: ${cost_per_client}",
     ]
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    logger.info("build_morning_report: отчёт сформирован, %d символов", len(result))
+    return result
 
 
 async def cmd_crm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1123,9 +1125,31 @@ async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_morning_report(app: Application):
     try:
+        logger.info("send_morning_report: формирую отчёт...")
         text = build_morning_report()
-        await app.bot.send_message(chat_id=GROUP_ID, text=text)
-        logger.info("Утренний отчёт отправлен")
+        logger.info("send_morning_report: отчёт готов, длина=%d символов", len(text))
+
+        # Telegram ограничение — 4096 символов на сообщение, разбиваем если нужно
+        MAX = 4000
+        if len(text) <= MAX:
+            await app.bot.send_message(chat_id=GROUP_ID, text=text)
+        else:
+            # Разбиваем по блокам (ищем перенос строки рядом с лимитом)
+            chunks = []
+            while text:
+                if len(text) <= MAX:
+                    chunks.append(text)
+                    break
+                split_at = text.rfind("\n", 0, MAX)
+                if split_at == -1:
+                    split_at = MAX
+                chunks.append(text[:split_at])
+                text = text[split_at:].lstrip("\n")
+            for i, chunk in enumerate(chunks, 1):
+                await app.bot.send_message(chat_id=GROUP_ID, text=chunk)
+                logger.info("send_morning_report: часть %d/%d отправлена", i, len(chunks))
+
+        logger.info("Утренний отчёт отправлен в GROUP_ID=%s", GROUP_ID)
     except Exception:
         logger.exception("Ошибка отправки утреннего отчёта")
 
@@ -1171,7 +1195,7 @@ def main():
     app.add_handler(MessageHandler(owner_confirmation_filter, handle_owner_confirmation))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("Бот запускается... [v5949059 — расширенный утренний отчёт + ДРР + Claude рекомендации]")
+    logger.info("Бот запускается... [v6250625 — fix: разбивка отчёта >4096 символов + лог длины]")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
