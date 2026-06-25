@@ -7,6 +7,8 @@ from datetime import datetime, date, timezone, timedelta
 import pytz
 
 import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  # Bitrix self-signed SSL
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -372,7 +374,7 @@ def fetch_bitrix_leads(time_range: dict) -> dict:
         "select[]": ["ID", "DATE_CREATE", "STATUS_ID", "SOURCE_ID", "UTM_SOURCE", "TITLE"],
         "start": 0,
     }
-    resp = requests.get(f"{BITRIX_WEBHOOK}/crm.lead.list", params=params, timeout=30)
+    resp = requests.get(f"{BITRIX_WEBHOOK}/crm.lead.list", params=params, timeout=30, verify=False)
     resp.raise_for_status()
     leads = resp.json().get("result", [])
 
@@ -397,7 +399,7 @@ def _fetch_all_deals(base_params: list) -> list[dict]:
     start = 0
     while True:
         params = base_params + [("start", start)]
-        resp = requests.get(f"{BITRIX_WEBHOOK}/crm.deal.list", params=params, timeout=30)
+        resp = requests.get(f"{BITRIX_WEBHOOK}/crm.deal.list", params=params, timeout=30, verify=False)
         resp.raise_for_status()
         batch = resp.json().get("result", [])
         result.extend(batch)
@@ -1126,7 +1128,10 @@ async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_morning_report(app: Application):
     try:
         logger.info("send_morning_report: формирую отчёт...")
-        text = build_morning_report()
+        # build_morning_report использует синхронный requests — запускаем в thread executor
+        # чтобы не блокировать asyncio event loop (иначе getUpdates останавливается)
+        loop = asyncio.get_event_loop()
+        text = await loop.run_in_executor(None, build_morning_report)
         logger.info("send_morning_report: отчёт готов, длина=%d символов", len(text))
 
         # Telegram ограничение — 4096 символов на сообщение, разбиваем если нужно
@@ -1156,8 +1161,22 @@ async def send_morning_report(app: Application):
 
 async def cmd_test_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        text = build_morning_report()
-        await context.bot.send_message(chat_id=GROUP_ID, text=text)
+        loop = asyncio.get_event_loop()
+        text = await loop.run_in_executor(None, build_morning_report)
+        MAX = 4000
+        if len(text) <= MAX:
+            await context.bot.send_message(chat_id=GROUP_ID, text=text)
+        else:
+            chunks = []
+            t = text
+            while t:
+                if len(t) <= MAX:
+                    chunks.append(t); break
+                split_at = t.rfind("\n", 0, MAX)
+                if split_at == -1: split_at = MAX
+                chunks.append(t[:split_at]); t = t[split_at:].lstrip("\n")
+            for chunk in chunks:
+                await context.bot.send_message(chat_id=GROUP_ID, text=chunk)
         if update.effective_chat.id != GROUP_ID:
             await update.message.reply_text("Отчёт отправлен в группу.")
     except Exception:
@@ -1195,7 +1214,7 @@ def main():
     app.add_handler(MessageHandler(owner_confirmation_filter, handle_owner_confirmation))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("Бот запускается... [v6250625 — fix: разбивка отчёта >4096 символов + лог длины]")
+    logger.info("Бот запускается... [v6250625b — fix: executor+verify=False для Bitrix SSL]")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
