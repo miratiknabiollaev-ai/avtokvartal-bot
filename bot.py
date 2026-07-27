@@ -336,6 +336,109 @@ def fetch_month_spend() -> float:
     return insights["spend"]
 
 
+def fetch_insights_range(since: str, until: str) -> dict:
+    """Суммарная статистика по кабинету за произвольный диапазон дат (YYYY-MM-DD)."""
+    params = {
+        "access_token": META_ACCESS_TOKEN,
+        "fields": "spend,actions,cost_per_action_type",
+        "time_range": json.dumps({"since": since, "until": until}),
+    }
+    resp = requests.get(f"{GRAPH_API_URL}/{AD_ACCOUNT}/insights", params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json().get("data", [])
+    if not data:
+        return {"spend": 0.0, "leads": 0, "cost_per_lead": 0.0}
+
+    row = data[0]
+    spend = float(row.get("spend", 0))
+    leads = 0
+    for action in row.get("actions", []):
+        if action.get("action_type") in (
+            "onsite_conversion.messaging_conversation_started_7d",
+            "messaging_conversation_started_7d",
+        ):
+            leads += int(float(action.get("value", 0)))
+    cost_per_lead = (spend / leads) if leads else 0.0
+    return {"spend": spend, "leads": leads, "cost_per_lead": cost_per_lead}
+
+
+def fetch_ads_breakdown_range(since: str, until: str) -> list[dict]:
+    """Разбивка по объявлениям за произвольный диапазон дат."""
+    params = {
+        "access_token": META_ACCESS_TOKEN,
+        "fields": "ad_id,ad_name,spend,actions",
+        "time_range": json.dumps({"since": since, "until": until}),
+        "level": "ad",
+        "limit": 100,
+    }
+    resp = requests.get(f"{GRAPH_API_URL}/{AD_ACCOUNT}/insights", params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json().get("data", [])
+
+    ads = []
+    for row in data:
+        spend = float(row.get("spend", 0))
+        leads = 0
+        for action in row.get("actions", []):
+            if action.get("action_type") in (
+                "onsite_conversion.messaging_conversation_started_7d",
+                "messaging_conversation_started_7d",
+            ):
+                leads += int(float(action.get("value", 0)))
+        cost_per_lead = (spend / leads) if leads else None
+        ads.append({
+            "name": row.get("ad_name", "Без названия"),
+            "spend": spend,
+            "leads": leads,
+            "cost_per_lead": cost_per_lead,
+        })
+    return ads
+
+
+def build_range_report(since: str, until: str, label: str) -> str:
+    """Сводный отчёт за произвольный диапазон дат."""
+    insights = fetch_insights_range(since, until)
+    ads = fetch_ads_breakdown_range(since, until)
+
+    spend = insights["spend"]
+    leads = insights["leads"]
+    cost_per_lead = insights["cost_per_lead"]
+
+    with_leads = [a for a in ads if a["leads"] > 0]
+    spenders = [a for a in ads if a["spend"] > 0]
+
+    if with_leads:
+        best = min(with_leads, key=lambda a: a["cost_per_lead"])
+        top_lines = []
+        for a in sorted(with_leads, key=lambda a: a["cost_per_lead"])[:3]:
+            top_lines.append(f"  • {a['name']} — ${a['cost_per_lead']:.2f}/заявка ({a['leads']} заявок, ${a['spend']:.2f})")
+        best_block = "\n".join(top_lines)
+    else:
+        best_block = "  нет объявлений с заявками"
+
+    if spenders:
+        worst = max(spenders, key=lambda a: (a["cost_per_lead"] or float("inf")))
+        if worst["cost_per_lead"]:
+            worst_line = f"{worst['name']} — ${worst['cost_per_lead']:.2f}/заявка (${worst['spend']:.2f})"
+        else:
+            worst_line = f"{worst['name']} — ${worst['spend']:.2f} потрачено, 0 заявок"
+    else:
+        worst_line = "нет данных"
+
+    total_ads = len(spenders)
+
+    return (
+        f"📊 ОТЧЁТ Автоквартал — {label}\n"
+        f"📅 {since} → {until}\n\n"
+        f"💰 Потрачено: ${spend:.2f}\n"
+        f"📩 Заявок из рекламы: {leads}\n"
+        f"💵 Цена заявки: ${cost_per_lead:.2f}\n"
+        f"📋 Активных объявлений: {total_ads}\n\n"
+        f"🏆 Лучшие объявления:\n{best_block}\n\n"
+        f"⚠️ Худшее: {worst_line}"
+    )
+
+
 # --- Bitrix24 CRM ---
 
 # Целевые источники сделок из Instagram и WhatsApp (названия каналов в Bitrix24)
@@ -1159,6 +1262,26 @@ async def send_morning_report(app: Application):
         logger.exception("Ошибка отправки утреннего отчёта")
 
 
+async def cmd_period_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отчёт за произвольный период: /отчёт_период 2026-07-17 2026-07-27"""
+    parts = (update.message.text or "").split()
+    if len(parts) >= 3:
+        since, until = parts[1], parts[2]
+        label = f"{since} – {until}"
+    else:
+        # По умолчанию — 17-27 июля
+        since, until = "2026-07-17", "2026-07-27"
+        label = "17–27 июля"
+    try:
+        text = build_range_report(since, until, label)
+        await context.bot.send_message(chat_id=GROUP_ID, text=text)
+        if update.effective_chat.id != GROUP_ID:
+            await update.message.reply_text("Отчёт отправлен в группу.")
+    except Exception:
+        logger.exception("Ошибка /отчёт_период")
+        await update.message.reply_text("Не удалось получить данные из Meta API.")
+
+
 async def cmd_test_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         loop = asyncio.get_event_loop()
@@ -1184,10 +1307,23 @@ async def cmd_test_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не удалось получить данные из Meta API.")
 
 
+async def send_10day_report(app: Application):
+    """Одноразовая отправка отчёта 17–27 июля в группу при старте бота."""
+    try:
+        text = build_range_report("2026-07-17", "2026-07-27", "17–27 июля")
+        await app.bot.send_message(chat_id=GROUP_ID, text=text)
+        logger.info("Отчёт 17–27 июля отправлен в группу")
+    except Exception:
+        logger.exception("Ошибка при отправке отчёта 17–27 июля")
+
+
 async def post_init(app: Application):
     scheduler = AsyncIOScheduler(timezone=TZ_NAME)
     scheduler.add_job(send_morning_report, CronTrigger(hour=9, minute=0, timezone=TZ_NAME), args=[app])
     scheduler.add_job(check_alerts, CronTrigger(minute="*/30"), args=[app])
+    # Одноразовый отчёт за 17–27 июля — через 15 секунд после старта
+    run_at = datetime.now(TZ) + timedelta(seconds=15)
+    scheduler.add_job(send_10day_report, "date", run_date=run_at, args=[app])
     scheduler.start()
     app.bot_data["scheduler"] = scheduler
     logger.info("Планировщик: ежедневный отчёт в 09:00 Asia/Almaty, алерты каждые 30 мин")
@@ -1210,6 +1346,7 @@ def main():
     app.add_handler(MessageHandler(cyrillic_command("бюджет"), cmd_budget))
     app.add_handler(MessageHandler(cyrillic_command("конверсия"), cmd_conversion))
     app.add_handler(MessageHandler(cyrillic_command("crm"), cmd_crm))
+    app.add_handler(MessageHandler(cyrillic_command(r"отч[её]т_период"), cmd_period_report))
     app.add_handler(MessageHandler(cyrillic_command("воронка"), cmd_funnel))
     app.add_handler(MessageHandler(owner_confirmation_filter, handle_owner_confirmation))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
