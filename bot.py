@@ -1309,9 +1309,6 @@ async def post_init(app: Application):
     scheduler = AsyncIOScheduler(timezone=TZ_NAME)
     scheduler.add_job(send_morning_report, CronTrigger(hour=9, minute=0, timezone=TZ_NAME), args=[app])
     scheduler.add_job(check_alerts, CronTrigger(minute="*/30"), args=[app])
-    # Одноразовый отчёт за 17–27 июля — через 15 секунд после старта
-    run_at = datetime.now(TZ) + timedelta(seconds=15)
-    scheduler.add_job(send_10day_report, "date", run_date=run_at, args=[app])
     scheduler.start()
     app.bot_data["scheduler"] = scheduler
     logger.info("Планировщик: ежедневный отчёт в 09:00 Asia/Almaty, алерты каждые 30 мин")
