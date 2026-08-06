@@ -163,6 +163,24 @@ def detect_period(text: str) -> tuple[str, str]:
     return result
 
 
+_LEAD_ACTION_TYPES = {
+    "onsite_conversion.messaging_conversation_started_7d",
+    "messaging_conversation_started_7d",
+    "onsite_conversion.total_messaging_connection",
+    "total_messaging_connection",
+}
+
+
+def _count_leads(actions: list) -> int:
+    """Берёт максимальное из всех messaging-конверсий (как Ads Manager, без двойного счёта)."""
+    counts = [
+        int(float(a.get("value", 0)))
+        for a in (actions or [])
+        if a.get("action_type") in _LEAD_ACTION_TYPES
+    ]
+    return max(counts, default=0)
+
+
 def fetch_insights(date_preset: str = "today", time_range: dict | None = None) -> dict:
     """Берёт суммарные данные по аккаунту: затраты, лиды (сообщения WhatsApp), цена за лид.
 
@@ -186,14 +204,9 @@ def fetch_insights(date_preset: str = "today", time_range: dict | None = None) -
 
     row = data[0]
     spend = float(row.get("spend", 0))
-    leads = 0
-    for action in row.get("actions", []):
-        if action.get("action_type") in (
-            "onsite_conversion.messaging_conversation_started_7d",
-            "messaging_conversation_started_7d",
-        ):
-            leads += int(float(action.get("value", 0)))
-
+    leads = _count_leads(row.get("actions", []))
+    logger.info("fetch_insights since=%s until=%s leads=%s spend=%s",
+                (time_range or {}).get("since"), (time_range or {}).get("until"), leads, spend)
     cost_per_lead = (spend / leads) if leads else 0.0
     return {"spend": spend, "leads": leads, "cost_per_lead": cost_per_lead}
 
@@ -222,13 +235,7 @@ def fetch_ads_breakdown(date_preset: str = "today", time_range: dict | None = No
     ads = []
     for row in data:
         spend = float(row.get("spend", 0))
-        leads = 0
-        for action in row.get("actions", []):
-            if action.get("action_type") in (
-                "onsite_conversion.messaging_conversation_started_7d",
-                "messaging_conversation_started_7d",
-            ):
-                leads += int(float(action.get("value", 0)))
+        leads = _count_leads(row.get("actions", []))
         cost_per_lead = (spend / leads) if leads else None
         ads.append({
             "id": row.get("ad_id"),
@@ -278,14 +285,7 @@ def fetch_campaigns_breakdown(time_range: dict) -> list[dict]:
     ad_rows = resp2.json().get("data", [])
 
     def extract_leads(row: dict) -> int:
-        leads = 0
-        for action in row.get("actions", []):
-            if action.get("action_type") in (
-                "onsite_conversion.messaging_conversation_started_7d",
-                "messaging_conversation_started_7d",
-            ):
-                leads += int(float(action.get("value", 0)))
-        return leads
+        return _count_leads(row.get("actions", []))
 
     # Строим словарь campaign_id → ads
     ads_by_camp: dict[str, list] = {}
@@ -351,13 +351,7 @@ def fetch_insights_range(since: str, until: str) -> dict:
 
     row = data[0]
     spend = float(row.get("spend", 0))
-    leads = 0
-    for action in row.get("actions", []):
-        if action.get("action_type") in (
-            "onsite_conversion.messaging_conversation_started_7d",
-            "messaging_conversation_started_7d",
-        ):
-            leads += int(float(action.get("value", 0)))
+    leads = _count_leads(row.get("actions", []))
     cost_per_lead = (spend / leads) if leads else 0.0
     return {"spend": spend, "leads": leads, "cost_per_lead": cost_per_lead}
 
@@ -378,13 +372,7 @@ def fetch_ads_breakdown_range(since: str, until: str) -> list[dict]:
     ads = []
     for row in data:
         spend = float(row.get("spend", 0))
-        leads = 0
-        for action in row.get("actions", []):
-            if action.get("action_type") in (
-                "onsite_conversion.messaging_conversation_started_7d",
-                "messaging_conversation_started_7d",
-            ):
-                leads += int(float(action.get("value", 0)))
+        leads = _count_leads(row.get("actions", []))
         cost_per_lead = (spend / leads) if leads else None
         ads.append({
             "name": row.get("ad_name", "Без названия"),
