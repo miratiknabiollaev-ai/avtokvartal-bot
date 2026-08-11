@@ -1121,6 +1121,114 @@ def build_morning_report() -> str:
     return result
 
 
+def build_weekly_report() -> str:
+    """Еженедельный отчёт: прошлый пн–вс по Asia/Almaty."""
+    almaty_tz = pytz.timezone("Asia/Almaty")
+    today = datetime.now(almaty_tz).date()
+    # Прошлый понедельник = today - today.weekday() - 7
+    last_monday = today - timedelta(days=today.weekday() + 7)
+    last_sunday = last_monday + timedelta(days=6)
+    since, until = str(last_monday), str(last_sunday)
+    time_range = {"since": since, "until": until}
+    logger.info("build_weekly_report: %s .. %s", since, until)
+
+    insights = fetch_insights_range(since, until)
+    spend = insights["spend"]
+    leads = insights["leads"]
+    cost_per_lead = insights["cost_per_lead"]
+
+    ads = fetch_ads_breakdown_range(since, until)
+    top3 = sorted([a for a in ads if a["leads"] > 0], key=lambda a: a["cost_per_lead"])[:3]
+    top3_lines = []
+    for i, a in enumerate(top3, 1):
+        top3_lines.append(f"{i}. {a['name']} — ${a['cost_per_lead']:.2f}/заявка, {a['leads']} заявок")
+    top3_block = "\n".join(top3_lines) if top3_lines else "нет объявлений с заявками"
+
+    try:
+        crm = fetch_bitrix_deals(time_range=time_range)
+        deals_total = crm["total"]
+        deals_closed = crm["closed"]
+        closed_amount = crm["closed_amount"]
+    except Exception:
+        logger.exception("Bitrix недоступен в еженедельном отчёте")
+        deals_total = deals_closed = 0
+        closed_amount = 0.0
+
+    usd_rate = float(os.environ.get("USD_KZT_RATE", "450"))
+    spend_kzt = spend * usd_rate
+    drr = round(spend_kzt / closed_amount * 100, 1) if closed_amount else 0.0
+
+    lines = [
+        f"Еженедельный отчёт Автоквартал — {last_monday.strftime('%d.%m')} по {last_sunday.strftime('%d.%m.%Y')}",
+        "",
+        "ОБЩИЙ ИТОГ",
+        f"Потрачено: ${spend:.2f}",
+        f"Заявок: {leads}",
+        f"Цена заявки: ${cost_per_lead:.2f}",
+        "",
+        "ТОП-3 КРЕАТИВА ПО ОКУПАЕМОСТИ",
+        top3_block,
+        "",
+        "CRM BITRIX",
+        f"Новых сделок: {deals_total}",
+        f"Закрытых: {deals_closed}",
+        f"Выручка: {closed_amount:,.0f} тг",
+        f"ДРР: {drr}%",
+    ]
+    return "\n".join(lines)
+
+
+async def send_weekly_report(app: Application):
+    try:
+        logger.info("send_weekly_report: формирую...")
+        loop = asyncio.get_event_loop()
+        text = await loop.run_in_executor(None, build_weekly_report)
+        MAX = 4000
+        if len(text) <= MAX:
+            await app.bot.send_message(chat_id=GROUP_ID, text=text)
+        else:
+            chunks = []
+            while text:
+                if len(text) <= MAX:
+                    chunks.append(text)
+                    break
+                split_at = text.rfind("\n", 0, MAX)
+                if split_at == -1:
+                    split_at = MAX
+                chunks.append(text[:split_at])
+                text = text[split_at:].lstrip("\n")
+            for chunk in chunks:
+                await app.bot.send_message(chat_id=GROUP_ID, text=chunk)
+        logger.info("Еженедельный отчёт отправлен в GROUP_ID=%s", GROUP_ID)
+    except Exception:
+        logger.exception("Ошибка отправки еженедельного отчёта")
+
+
+async def send_aug1_10_report(app: Application):
+    """Разовый отчёт 1–10 августа — отправляется через 15 сек после деплоя."""
+    try:
+        text = build_range_report("2026-08-01", "2026-08-10", "1–10 августа")
+        MAX = 4000
+        if len(text) <= MAX:
+            await app.bot.send_message(chat_id=GROUP_ID, text=text)
+        else:
+            chunks = []
+            while text:
+                if len(text) <= MAX:
+                    chunks.append(text)
+                    break
+                split_at = text.rfind("\n", 0, MAX)
+                if split_at == -1:
+                    split_at = MAX
+                chunks.append(text[:split_at])
+                text = text[split_at:].lstrip("\n")
+            for chunk in chunks:
+                await app.bot.send_message(chat_id=GROUP_ID, text=chunk)
+        logger.info("Отчёт 1–10 августа отправлен")
+    except Exception:
+        logger.exception("Ошибка отправки отчёта 1–10 августа")
+
+
 async def cmd_crm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Текущие лиды и сделки за сегодня из Bitrix24."""
     since, until = get_period_almaty("today")
@@ -1306,12 +1414,22 @@ async def send_10day_report(app: Application):
 
 
 async def post_init(app: Application):
-    scheduler = AsyncIOScheduler(timezone=TZ_NAME)
-    scheduler.add_job(send_morning_report, CronTrigger(hour=9, minute=0, timezone=TZ_NAME), args=[app])
+    almaty_tz = pytz.timezone(TZ_NAME)
+    scheduler = AsyncIOScheduler(timezone=almaty_tz)
+    # Ежедневный отчёт за вчера в 00:05 Asia/Almaty
+    scheduler.add_job(send_morning_report, CronTrigger(hour=0, minute=5, timezone=almaty_tz), args=[app])
+    # Еженедельный отчёт каждый понедельник в 09:00 Asia/Almaty
+    scheduler.add_job(send_weekly_report, CronTrigger(day_of_week="mon", hour=9, minute=0, timezone=almaty_tz), args=[app])
+    # Алерты каждые 30 минут
     scheduler.add_job(check_alerts, CronTrigger(minute="*/30"), args=[app])
+    # Разовый отчёт 1–10 августа — через 15 секунд после старта
+    run_at = datetime.now(almaty_tz) + timedelta(seconds=15)
+    scheduler.add_job(send_aug1_10_report, "date", run_date=run_at, args=[app])
     scheduler.start()
     app.bot_data["scheduler"] = scheduler
-    logger.info("Планировщик: ежедневный отчёт в 09:00 Asia/Almaty, алерты каждые 30 мин")
+    logger.info(
+        "Планировщик: ежедневный в 00:05, еженедельный пн 09:00, алерты каждые 30 мин (Asia/Almaty)"
+    )
 
 
 def main():
