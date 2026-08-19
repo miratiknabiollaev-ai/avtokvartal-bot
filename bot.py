@@ -1084,8 +1084,9 @@ def build_morning_report() -> str:
     # ── Цена покупателя ───────────────────────────────────────────────────────
     cost_per_client = round(spend / deals_closed, 2) if deals_closed else 0
 
+    yesterday_label = datetime.strptime(since, "%Y-%m-%d").strftime("%d.%m.%Y")
     lines = [
-        f"Отчёт Автоквартал — {since}",
+        f"Отчёт Автоквартал — {yesterday_label}",
         "",
         "ОБЩИЙ ИТОГ",
         f"Потрачено: ${spend:.2f}",
@@ -1416,20 +1417,19 @@ async def send_10day_report(app: Application):
 async def post_init(app: Application):
     almaty_tz = pytz.timezone(TZ_NAME)
     scheduler = AsyncIOScheduler(timezone=almaty_tz)
-    # Ежедневный отчёт за вчера в 00:05 Asia/Almaty
-    scheduler.add_job(send_morning_report, CronTrigger(hour=0, minute=5, timezone=almaty_tz), args=[app])
+    # Ежедневный отчёт за вчера в 09:00 Asia/Almaty
+    scheduler.add_job(send_morning_report, CronTrigger(hour=9, minute=0, timezone=almaty_tz), args=[app])
     # Еженедельный отчёт каждый понедельник в 09:00 Asia/Almaty
     scheduler.add_job(send_weekly_report, CronTrigger(day_of_week="mon", hour=9, minute=0, timezone=almaty_tz), args=[app])
     # Алерты каждые 30 минут
     scheduler.add_job(check_alerts, CronTrigger(minute="*/30"), args=[app])
-    # Разовый отчёт 1–10 августа — через 15 секунд после старта
-    run_at = datetime.now(almaty_tz) + timedelta(seconds=15)
-    scheduler.add_job(send_aug1_10_report, "date", run_date=run_at, args=[app])
     scheduler.start()
     app.bot_data["scheduler"] = scheduler
-    logger.info(
-        "Планировщик: ежедневный в 00:05, еженедельный пн 09:00, алерты каждые 30 мин (Asia/Almaty)"
-    )
+    now_kz = datetime.now(almaty_tz)
+    daily_job = scheduler.get_jobs()[0]
+    logger.info("Scheduler запущен. Текущее время KZ: %s", now_kz.strftime("%Y-%m-%d %H:%M:%S %Z"))
+    logger.info("Следующий утренний отчёт: %s", daily_job.next_run_time)
+    logger.info("Планировщик: ежедневный в 09:00, еженедельный пн 09:00, алерты каждые 30 мин (Asia/Almaty)")
 
 
 def main():
