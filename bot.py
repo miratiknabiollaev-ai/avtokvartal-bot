@@ -1416,13 +1416,14 @@ async def send_10day_report(app: Application):
 
 async def post_init(app: Application):
     almaty_tz = pytz.timezone(TZ_NAME)
+    # timezone задаётся только на уровне scheduler — триггеры наследуют его
     scheduler = AsyncIOScheduler(timezone=almaty_tz)
     # Ежедневный отчёт за вчера в 09:00 Asia/Almaty
-    scheduler.add_job(send_morning_report, CronTrigger(hour=9, minute=0, timezone=almaty_tz), args=[app])
+    scheduler.add_job(send_morning_report, "cron", hour=9, minute=0, args=[app])
     # Еженедельный отчёт каждый понедельник в 09:00 Asia/Almaty
-    scheduler.add_job(send_weekly_report, CronTrigger(day_of_week="mon", hour=9, minute=0, timezone=almaty_tz), args=[app])
+    scheduler.add_job(send_weekly_report, "cron", day_of_week="mon", hour=9, minute=0, args=[app])
     # Алерты каждые 30 минут
-    scheduler.add_job(check_alerts, CronTrigger(minute="*/30"), args=[app])
+    scheduler.add_job(check_alerts, "cron", minute="*/30", args=[app])
     scheduler.start()
     app.bot_data["scheduler"] = scheduler
     now_kz = datetime.now(almaty_tz)
