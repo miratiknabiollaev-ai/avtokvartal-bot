@@ -141,6 +141,43 @@ def get_yesterday_almaty() -> tuple[str, str]:
     return get_period_almaty("yesterday")
 
 
+def get_yesterday_kz():
+    """Возвращает границы вчерашних суток строго по UTC+5 (Asia/Almaty).
+
+    Meta API принимает только YYYY-MM-DD, поэтому передаём KZ-дату напрямую —
+    Meta использует timezone рекламного кабинета (Almaty) для интерпретации дат.
+    Bitrix24 принимает datetime в UTC, поэтому конвертируем границы суток из KZ в UTC.
+
+    Returns:
+        meta_since   — YYYY-MM-DD (KZ-дата, Meta интерпретирует по timezone кабинета)
+        meta_until   — YYYY-MM-DD (то же)
+        bitrix_from  — YYYY-MM-DDTHH:MM:SS в UTC (00:00 KZ → UTC)
+        bitrix_to    — YYYY-MM-DDTHH:MM:SS в UTC (23:59:59 KZ → UTC)
+        report_date  — DD.MM.YYYY для заголовка отчёта
+    """
+    kz_tz = pytz.timezone("Asia/Almaty")
+    now_kz = datetime.now(kz_tz)
+    yesterday_kz = now_kz - timedelta(days=1)
+
+    start_kz = yesterday_kz.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_kz = yesterday_kz.replace(hour=23, minute=59, second=59, microsecond=0)
+
+    start_utc = start_kz.astimezone(pytz.utc)
+    end_utc = end_kz.astimezone(pytz.utc)
+
+    meta_since = start_kz.strftime("%Y-%m-%d")
+    meta_until = end_kz.strftime("%Y-%m-%d")
+    bitrix_from = start_utc.strftime("%Y-%m-%dT%H:%M:%S")
+    bitrix_to = end_utc.strftime("%Y-%m-%dT%H:%M:%S")
+    report_date = yesterday_kz.strftime("%d.%m.%Y")
+
+    logger.info("Период KZ: %s — %s", start_kz.strftime("%Y-%m-%d %H:%M %Z"), end_kz.strftime("%Y-%m-%d %H:%M %Z"))
+    logger.info("Meta API: since=%s until=%s", meta_since, meta_until)
+    logger.info("Bitrix: from=%s to=%s", bitrix_from, bitrix_to)
+
+    return meta_since, meta_until, bitrix_from, bitrix_to, report_date
+
+
 def detect_period(text: str) -> tuple[str, str]:
     """Определяет период по тексту сообщения: (preset, человекочитаемая подпись).
 
@@ -442,22 +479,26 @@ INSTAGRAM_WHATSAPP_SOURCES = [
 ]
 
 
-def _time_range_to_bitrix(time_range: dict) -> tuple[str, str]:
-    """Конвертирует time_range {'since': 'YYYY-MM-DD', 'until': 'YYYY-MM-DD'}
-    в строки для Bitrix24 filter: (date_from, date_to).
-    Всегда покрывает полный день с 00:00:00 до 23:59:59.
+def _time_range_to_bitrix(time_range: dict, bitrix_from: str | None = None, bitrix_to: str | None = None) -> tuple[str, str]:
+    """Конвертирует time_range в строки для Bitrix24 filter.
+
+    Если переданы bitrix_from/bitrix_to (UTC datetime из get_yesterday_kz) — используем их.
+    Иначе берём дату из time_range и добавляем T00:00:00 / T23:59:59 (старый путь).
     """
+    if bitrix_from and bitrix_to:
+        return bitrix_from, bitrix_to
     since = time_range["since"]
     until = time_range["until"]
     return f"{since}T00:00:00", f"{until}T23:59:59"
 
 
-def fetch_bitrix_leads(time_range: dict) -> dict:
-    """Возвращает лиды из Bitrix24 за период, заданный явными датами.
+def fetch_bitrix_leads(time_range: dict, bitrix_from: str | None = None, bitrix_to: str | None = None) -> dict:
+    """Возвращает лиды из Bitrix24 за период.
 
     time_range: {"since": "YYYY-MM-DD", "until": "YYYY-MM-DD"}
+    bitrix_from/to: UTC datetime строки из get_yesterday_kz() — приоритет над time_range.
     """
-    date_from, date_to = _time_range_to_bitrix(time_range)
+    date_from, date_to = _time_range_to_bitrix(time_range, bitrix_from, bitrix_to)
     logger.info("fetch_bitrix_leads: DATE_CREATE %s .. %s", date_from, date_to)
     params = {
         "filter[>=DATE_CREATE]": date_from,
@@ -500,13 +541,13 @@ def _fetch_all_deals(base_params: list) -> list[dict]:
     return result
 
 
-def fetch_bitrix_deals(time_range: dict) -> dict:
+def fetch_bitrix_deals(time_range: dict, bitrix_from: str | None = None, bitrix_to: str | None = None) -> dict:
     """Сделки Instagram/WhatsApp за период: созданные + закрытые (по CLOSEDATE).
 
     time_range: {"since": "YYYY-MM-DD", "until": "YYYY-MM-DD"}
-    Тот же time_range что передаётся в Meta API — единый источник правды по периоду.
+    bitrix_from/to: UTC datetime строки из get_yesterday_kz() — приоритет над time_range.
     """
-    date_from, date_to = _time_range_to_bitrix(time_range)
+    date_from, date_to = _time_range_to_bitrix(time_range, bitrix_from, bitrix_to)
     logger.info("fetch_bitrix_deals: DATE_CREATE %s .. %s", date_from, date_to)
 
     select_fields = [
@@ -1020,12 +1061,11 @@ def _build_recommendations(campaigns: list[dict], usd_rate: float) -> str:
 def build_morning_report() -> str:
     """Развёрнутый отчёт за вчерашний день: Meta Ads (по кампаниям) + Bitrix24 + ДРР.
 
-    ВАЖНО: используем явные даты since/until в Asia/Almaty вместо date_preset="yesterday",
-    так как Railway работает в UTC и Meta API считал бы "вчера" не по Алматы.
+    Использует get_yesterday_kz(): Meta получает KZ-дату, Bitrix — UTC datetime границы суток.
     """
-    since, until = get_yesterday_almaty()
-    time_range = {"since": since, "until": until}
-    logger.info("build_morning_report: time_range=%s", time_range)
+    meta_since, meta_until, bitrix_from, bitrix_to, report_date = get_yesterday_kz()
+    time_range = {"since": meta_since, "until": meta_until}
+    since = meta_since  # для совместимости с остальным кодом функции
 
     usd_rate = float(os.environ.get("USD_KZT_RATE", "450"))
 
@@ -1060,7 +1100,7 @@ def build_morning_report() -> str:
 
     # ── Bitrix данные ─────────────────────────────────────────────────────────
     try:
-        crm = fetch_bitrix_deals(time_range=time_range)
+        crm = fetch_bitrix_deals(time_range=time_range, bitrix_from=bitrix_from, bitrix_to=bitrix_to)
         deals_total = crm["total"]
         deals_closed = crm["closed"]
         closed_amount = crm["closed_amount"]
@@ -1084,9 +1124,8 @@ def build_morning_report() -> str:
     # ── Цена покупателя ───────────────────────────────────────────────────────
     cost_per_client = round(spend / deals_closed, 2) if deals_closed else 0
 
-    yesterday_label = datetime.strptime(since, "%Y-%m-%d").strftime("%d.%m.%Y")
     lines = [
-        f"Отчёт Автоквартал — {yesterday_label}",
+        f"Отчёт Автоквартал — {report_date}",
         "",
         "ОБЩИЙ ИТОГ",
         f"Потрачено: ${spend:.2f}",
